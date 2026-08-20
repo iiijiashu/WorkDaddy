@@ -1,11 +1,11 @@
 @echo off
+chcp 65001 >nul
 rem ============================================================
-rem  WorkDaddy Windows 安装包自检脚本（双击运行）
-rem  作用：验证 Setup.exe / zip 解出的 scripts 是否「完整、可装、可启动」
-rem  不修改任何系统状态，纯只读检查，可放心重复运行。
+rem  WorkDaddy Windows package verifier
+rem  Read-only checks for packaged scripts and launch prerequisites.
+rem  Safe to run repeatedly; this script does not change system state.
 rem ============================================================
 setlocal
-chcp 65001 >nul
 cd /d "%~dp0"
 set "SCRIPT_DIR=%~dp0"
 
@@ -18,7 +18,7 @@ set "FAIL=0"
 rem ---- 1) 关键文件齐全 ----
 echo.
 echo [1/6] 检查关键文件...
-for %%F in (daemon.js lib.js watchdog.js win-launcher.js inject.js theme-patches.js launcher.cmd install-win.cmd install-win.ps1 win\setup.sed) do (
+for %%F in (daemon.js lib.js watchdog.js win-launcher.js win-inject-helper.js inject.js theme-patches.js launcher.cmd launch-hidden.vbs install-win.cmd install-win.ps1 repair-entrypoints.ps1 apply-update.ps1 win\setup.sed) do (
   if not exist "%SCRIPT_DIR%%%F" (
     echo   缺失: %%~F
     set /a FAIL+=1
@@ -63,11 +63,16 @@ for %%F in (daemon.js lib.js watchdog.js win-launcher.js inject.js theme-patches
   )
 )
 echo   JS 语法检查完成
+cscript //B //Nologo "%SCRIPT_DIR%launch-hidden.vbs" /check >nul 2>&1
+if errorlevel 1 (
+  echo   语法错误: launch-hidden.vbs
+  set /a FAIL+=1
+)
 
 rem ---- 4) PS1 合法性（PowerShell 解析但不执行）----
 echo.
 echo [4/6] 校验 PS1 脚本语法...
-for %%F in (install-win.ps1) do (
+for %%F in (install-win.ps1 repair-entrypoints.ps1 apply-update.ps1 uninstall-win.ps1) do (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('%SCRIPT_DIR%%%F',[ref]$null,[ref]$e); if($e){Write-Host ('  语法错误: ' + $e.Message); exit 1} else {Write-Host ('  OK: ' + '%%~nF')}; exit 0" >nul 2>&1
   if errorlevel 1 (
     echo   语法错误: %%~F
@@ -109,4 +114,5 @@ if "%FAIL%"=="0" (
   echo  发现 %FAIL% 处问题，请在下方对照修正后再分发。
 )
 echo ============================================================
-pause
+if /I not "%~1"=="--ci" pause
+exit /b %FAIL%

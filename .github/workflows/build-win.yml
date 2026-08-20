@@ -1,4 +1,4 @@
-name: Build & Verify Windows Setup
+name: Build & Verify Windows Release
 
 # 触发方式（任选其一都会跑这套打包+验证）：
 #   - 推 v* 标签（正式发版）
@@ -8,6 +8,7 @@ on:
   push:
     tags:
       - 'v*'
+      - '[0-9]*'
   workflow_dispatch:
     inputs:
       version:
@@ -20,7 +21,7 @@ permissions:
 
 jobs:
   build-and-verify:
-    name: Build zip + Setup.exe + verify
+    name: Build zip + verify
     runs-on: windows-latest   # IExpress 是真 GUI，必须在 Windows runner 上打包
     steps:
       - name: Checkout
@@ -63,37 +64,34 @@ jobs:
         shell: bash
         run: bash scripts/build-win-zip.sh
 
-      - name: 生成 Setup.exe（IExpress 自解压安装包）
-        shell: cmd
-        run: |
-          call scripts\make-setup.cmd
-
       - name: 列出产物
         shell: bash
         run: ls -lh release/
 
-      - name: 产物完整性自检（verify-win.cmd，纯只读）
-        shell: cmd
+      - name: 解压并验收最终 Windows zip
+        shell: powershell
         run: |
-          call scripts\verify-win.cmd
+          $zip = "release/WorkDaddy-${{ steps.ver.outputs.version }}-win64.zip"
+          $dst = Join-Path $env:RUNNER_TEMP 'workdaddy-release-check'
+          Remove-Item -Recurse -Force $dst -ErrorAction SilentlyContinue
+          Expand-Archive -Path $zip -DestinationPath $dst -Force
+          if (-not (Test-Path (Join-Path $dst 'Install-WorkDaddy.cmd'))) { throw 'zip 缺少顶层 Install-WorkDaddy.cmd' }
+          if (-not (Test-Path (Join-Path $dst 'Start-WorkDaddy.cmd'))) { throw 'zip 缺少顶层 Start-WorkDaddy.cmd' }
+          if (-not (Test-Path (Join-Path $dst 'launcher.cmd'))) { throw 'zip 缺少 1.0.4 更新兼容入口 launcher.cmd' }
+          if (-not (Test-Path (Join-Path $dst 'scripts\launch-hidden.vbs'))) { throw 'zip 缺少静默启动器' }
+          cmd /d /c "call `"$dst\scripts\verify-win.cmd`" --ci"
+          if ($LASTEXITCODE -ne 0) { throw "release verify failed: $LASTEXITCODE" }
 
-      - name: 上传产物（zip + Setup.exe）
+      - name: 上传 Windows zip
         uses: actions/upload-artifact@v4
         with:
           name: workdaddy-win64
-          path: |
-            release/WorkDaddy-*-win64.zip
-            release/WorkDaddy-Setup.exe
-            release/WorkDaddy-Setup-*.exe
+          path: release/WorkDaddy-*-win64.zip
 
-      # ---- 只有打 tag 时才顺手挂到 GitHub Release ----
+      # ---- 打 tag 时挂到 GitHub Release；兼容 v1.0.5 与 1.0.5 两种 tag 风格 ----
       - name: 发布到 GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: |
-            release/WorkDaddy-*-win64.zip
-            release/WorkDaddy-Setup.exe
-            release/WorkDaddy-Setup-*.exe
-            release/*.dmg
+          files: release/WorkDaddy-*-win64.zip
           generate_release_notes: true

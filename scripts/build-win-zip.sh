@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# WorkDaddy Windows 发布包打包脚本（在 macOS/Linux 上运行即可产出 Windows zip）
+# WorkDaddy Windows 发布包打包脚本（在 macOS/Linux/Git Bash 上运行即可产出 Windows zip）
 # 产出：release/WorkDaddy-<ver>-win64.zip（顶层含 scripts\，供 install-win.cmd / apply-update.ps1 使用）
 # 可选：内置 node_modules/ws（面板 DevTools 代理依赖；无则代理功能降级，其余功能不受影响）
 set -euo pipefail
@@ -42,6 +42,14 @@ rm -f "$OUT"
 # 3.1) 顶层入口（zip 根）：Install-WorkDaddy.cmd / Start-WorkDaddy.cmd
 cp scripts/Install-WorkDaddy.cmd "$STAGE/Install-WorkDaddy.cmd"
 cp scripts/Start-WorkDaddy.cmd "$STAGE/Start-WorkDaddy.cmd"
+# 兼容 1.0.4 的旧 apply-update.ps1：它更新后固定寻找 <AppDir>\launcher.cmd。
+# 根 shim 只负责迁移静默入口并转交 scripts/launch-hidden.vbs，后续版本不再依赖它。
+printf '%s\r\n' \
+  '@echo off' \
+  'setlocal' \
+  'if exist "%~dp0scripts\repair-entrypoints.ps1" powershell -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File "%~dp0scripts\repair-entrypoints.ps1" -AppDir "%~dp0"' \
+  'if exist "%~dp0scripts\launch-hidden.vbs" start "" /b wscript.exe //B //Nologo "%~dp0scripts\launch-hidden.vbs"' \
+  'exit /b 0' > "$STAGE/launcher.cmd"
 # 3.2) scripts\ 本体（含 node_modules/ws、builtin）
 cp -R scripts "$STAGE/scripts"
 # 3.2a) Logo 图标：放入 scripts\（install-win.ps1 从 SrcDir 同名找并复制到安装目录根）
@@ -61,10 +69,14 @@ find "$STAGE" -name '.DS_Store' -delete 2>/dev/null || true
 # 3.4) 打包：zip 优先；无 zip 的环境用 Windows 系统自带 bsdtar（生成标准 / 分隔符 zip）。
 #      绝不用 PowerShell Compress-Archive —— 它产出反斜杠分隔符，非标准 zip 会被解压工具把
 #      scripts\daemon.js 当单个文件名，导致解压结构错乱、入口秒退。
+PYTHON_BIN="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
 if command -v zip >/dev/null 2>&1; then
   (cd "$STAGE" && zip -r -q "$DIR/$OUT" .)
+elif [ -n "$PYTHON_BIN" ]; then
+  "$PYTHON_BIN" -c 'import os,sys,zipfile; root,out=sys.argv[1],sys.argv[2]; z=zipfile.ZipFile(out,"w",zipfile.ZIP_DEFLATED); [z.write(os.path.join(dp,f), os.path.relpath(os.path.join(dp,f),root).replace(os.sep,"/")) for dp,_,fs in os.walk(root) for f in fs]; z.close()' "$STAGE" "$DIR/$OUT"
 else
-  tar -a -cf "$DIR/$OUT" -C "$STAGE" .
+  echo "==> 错误: 未找到 zip / python3 / python，无法生成标准 ZIP"
+  exit 1
 fi
 rm -rf "$STAGE"
 
