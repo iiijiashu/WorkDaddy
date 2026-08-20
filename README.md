@@ -50,8 +50,9 @@
 
 1. 在 [Releases](../../releases) 下载最新 `WorkDaddy-x.y.z-win64.zip`
 2. **解压到桌面以外的文件夹，双击一键安装脚本 `Install-WorkDaddy.cmd`**：
-3. 以后只需**右键以管理员身份打开桌面的 WorkDaddy 图标** 即可启动
-4. 回到 WorkBuddy 看到右下角机器人按钮即成功；
+3. 安装完成后，日常只需**双击桌面的 WorkDaddy 图标**；正常的用户目录安装不会要求管理员权限，也不会弹命令行黑框
+4. 解压出来的 Release/源码目录只作为安装与开发来源，日常运行统一使用安装后的桌面入口，避免两套脚本同时使用同一 daemon/数据目录
+5. 回到 WorkBuddy 看到右下角机器人按钮即成功；如需排障，可手动运行安装目录下 `scripts\launcher.cmd --interactive`
 
 
 ### 从源码运行（开发者）

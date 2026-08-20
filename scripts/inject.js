@@ -76,6 +76,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   try { console.log('[WBS] inject.js 已执行于', location.href, 'body=', !!document.body); } catch (_) {}
   if (window.__wbsWidget) return; // 理论上 cleanup 已清除，保留为兜底
   var API = '__WBS_API__';
+  var API_TOKEN = '__WBS_TOKEN__';
 
   // ===== 全局错误钩子：捕获渲染进程不可捕获的 error / unhandledrejection，把完整消息+栈
   // 打到 daemon 日志。渲染进程级崩溃（如 An object could not be cloned）虽非 try/catch 能拦，
@@ -93,7 +94,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       var line = '[wbscrash] ' + kind + ': ' + msg + (stack ? '\n' + stack : '');
       try { console.error(line); } catch (_) {}
       try {
-        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
+        api('/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg: 'crash:' + kind + ':' + msg, extra: { stack: (stack || '').slice(0, 1500) } }) }).catch(function () {});
       } catch (_) {}
     }
     window.addEventListener('error', function (ev) { wbsReportErr('error', ev); });
@@ -181,6 +182,10 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
   }
 
   function api(path, opts) {
+    opts = opts || {};
+    var headers = opts.headers || {};
+    headers['X-WorkDaddy-Token'] = API_TOKEN;
+    opts.headers = headers;
     return fetch(API + path, opts).then(function (r) {
       return r.json().then(function (j) {
         if (!r.ok || j.ok === false) throw new Error(j.error || '请求失败');
@@ -1231,7 +1236,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
     function crumb(msg) {
       try { console.log('[wbscrum]', msg); } catch (e) {}
       try {
-        fetch(API + '/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg: msg }) }).catch(function () {});
+        api('/api/breadcrumb', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ msg: msg }) }).catch(function () {});
       } catch (e) {}
     }
     listen(stashBtn, 'click', function () {
@@ -1425,7 +1430,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
       // 分组（保持空间出现顺序：按该空间最早会话时间倒序）
       // 区分「任务」与「空间」：任务 = 未选择具体项目，cwd 为 WorkBuddy/<时间戳> 自动目录
       function isTaskSession(s) {
-        return /\/WorkBuddy\/\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}/.test(s.cwd || '');
+        return /[\\/]WorkBuddy(?: AI)?[\\/]\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}/i.test(s.cwd || '');
       }
       var tasks = [];
       var groups = {};
@@ -1511,7 +1516,7 @@ if (typeof window !== 'undefined' && typeof document !== 'undefined') {
           var w = wsCheck.getAttribute('data-ws');
           var arr;
           if (w === '__TASKS__') {
-            arr = sessionsState.list.filter(function (s) { return /\/WorkBuddy\/\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}/.test(s.cwd || ''); });
+            arr = sessionsState.list.filter(function (s) { return /[\\/]WorkBuddy(?: AI)?[\\/]\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}/i.test(s.cwd || ''); });
           } else {
             arr = sessionsState.list.filter(function (s) { return (s.cwd || '(未指定空间)') === w; });
           }

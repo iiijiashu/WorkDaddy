@@ -29,6 +29,14 @@ if (Test-Path $pidFile) {
   } catch {}
 }
 
+# 1.5) 清理旧版 launcher.cmd 的交互窗口；1.0.4 末尾 pause 会长期持有脚本文件。
+try {
+  $oldLauncher = (Join-Path $AppDir 'scripts\launcher.cmd').ToLowerInvariant()
+  Get-CimInstance Win32_Process -Filter "Name='cmd.exe'" -ErrorAction SilentlyContinue |
+    Where-Object { $_.CommandLine -and $_.CommandLine.ToLowerInvariant().Contains($oldLauncher) } |
+    ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
+} catch {}
+
 # 2) 兜底：按 API 端口杀残留进程
 $waitSec = 0
 while ($waitSec -lt 30) {
@@ -82,13 +90,19 @@ if ($rc -ge 8) {
   exit 2
 }
 
-# 5) 清理备份 + 拉起（launcher 幂等：检测 daemon 后启动 watchdog）
+# 5) 清理备份 + 静默拉起（release zip 的 launcher 位于 scripts\）
 Remove-Item -Recurse -Force $oldDir -ErrorAction SilentlyContinue
-$launcher = Join-Path $AppDir 'launcher.cmd'
-if (Test-Path $launcher) {
-  # 直接启动 launcher.cmd（Start-Process 传单个参数字符串在 PS5.1 不会自动补外层引号，
-  # 含空格路径会被拆散——直接指定 FilePath+WorkingDirectory 最稳）
-  Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher)
+$hiddenLauncher = Join-Path $AppDir 'scripts\launch-hidden.vbs'
+$launcher = Join-Path $AppDir 'scripts\launcher.cmd'
+$repairEntrypoints = Join-Path $AppDir 'scripts\repair-entrypoints.ps1'
+$wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+if (Test-Path $repairEntrypoints) {
+  try { & $repairEntrypoints -AppDir $AppDir } catch { Write-Host ('[apply] 修复静默入口失败: ' + $_.Exception.Message) }
+}
+if (Test-Path $hiddenLauncher) {
+  Start-Process -FilePath $wscript -ArgumentList @('//B', '//Nologo', $hiddenLauncher) -WindowStyle Hidden
+} elseif (Test-Path $launcher) {
+  Start-Process -FilePath $launcher -WorkingDirectory (Split-Path $launcher) -WindowStyle Hidden
 }
 Write-Host "[apply] $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') done"
 Stop-Transcript

@@ -1,8 +1,8 @@
 @echo off
+chcp 65001 >nul
 rem WorkDaddy Windows 安装核心（由 Install-WorkDaddy.cmd 或安装目录调用）
 rem 仅用 %~dp0 绝对路径定位 install-win.ps1，杜绝 scripts\scripts 嵌套导致的相对路径歧义
 setlocal
-chcp 65001 >nul
 
 where powershell >nul 2>nul
 if errorlevel 1 (

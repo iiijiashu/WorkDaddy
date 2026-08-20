@@ -1,4 +1,5 @@
 @echo off
+chcp 65001 >nul
 rem ============================================================
 rem  WorkDaddy 一键安装（zip 解压后的顶层入口，双击运行）
 rem  作用：复制到 %LOCALAPPDATA%\Programs\WorkDaddy → 注册开机自启
@@ -12,7 +13,6 @@ rem        这样无论从哪个目录双击、即便目录里残留 scripts\scr
 rem        也只认"与本文件同级的 scripts\install-win.ps1"，杜绝路径歧义。
 rem ============================================================
 setlocal
-chcp 65001 >nul
 
 rem ---------- 0) 找到真正的包根（向上穿透 scripts 嵌套残留） ----------
 set "PKGROOT=%~dp0"

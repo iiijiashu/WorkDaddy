@@ -11,8 +11,9 @@
  * 若未开启 CDP，守护进程自动降级为文件监听模式，基础备份/切换功能不受影响。
  *
  * 环境变量：
- *   WBSWITCH_AUTH_FILE   登录信息文件路径（默认 CodeBuddyExtension 下 auth/workbuddy-desktop.info）
+ *   WBSWITCH_AUTH_FILE   登录信息文件路径（默认自动识别 workbuddy-desktop-ai / legacy id）
  *   WBSWITCH_DATA_DIR    备份数据目录（默认 ~/Library/Application Support/WorkDaddy）
+ *   WBSWITCH_WORKBUDDY_HOME  WorkBuddy 数据根目录（默认自动识别 ~/.workbuddy-ai / ~/.workbuddy）
  *   WBSWITCH_PORT        Web 界面端口（默认 47832，被占用则 +1 尝试）
  *   WBSWITCH_CDP_PORT    WorkBuddy CDP 端口（默认自动探测 9222/9223/9333）
  *
@@ -63,7 +64,8 @@ const DATA_DIR = defaultDataDir();
 // 1.0.2：代码块容器 /.cb-markdown-pre-container 毛玻璃 + chat widget 容器毛玻璃 + 表头半透明（theme-patches patch-77/78）
 // 1.0.3：欢迎页隐藏暂存提示词按钮（inject isWelcomePage）；chat widget 预览 iframe 背景透明（patch-80 + inject 同源注入兜底）；
 //       默认主题改为「WorkBuddy 默认主题」（首次初始化/面板回退不再指向 nebula）
-const DAEMON_VERSION = '1.0.4';
+// 1.0.5：Windows WorkBuddyAI 5.3.x 兼容；静默启动；认证/会话目录迁移；启动、更新与本地 API 加固。
+const DAEMON_VERSION = '1.0.5';
 const HOST = '127.0.0.1';
 const IS_WIN = process.platform === 'win32'; // Windows 移植：平台分支开关（macOS 行为保持不变）
 // Windows 安装目录（install.ps1 铺、launcher 用、更新替换目标），对应 macOS 的 /Applications/WorkDaddy.app
@@ -74,6 +76,7 @@ let ACTUAL_PORT = UI_PORT_BASE; // 实际监听端口（被占用时 +1）
 const CDP_PORT_HINT = process.env.WBSWITCH_CDP_PORT
   ? parseInt(process.env.WBSWITCH_CDP_PORT, 10)
   : null;
+const API_TOKEN_FILE = path.join(DATA_DIR, 'api-token');
 const WATCH_INTERVAL = 3000; // 文件监听兜底
 const BACKUP_DEBOUNCE = 1500; // CDP 事件触发的备份防抖
 const CDP_RECONNECT_MS = 5000;
@@ -98,9 +101,24 @@ const updateState = {
   progress: 0, // 0-100
   message: '',
   error: null,
+  sha256: null,
   checkedAt: 0,
 };
 let updateTimer = null;
+
+function ensureApiToken() {
+  try {
+    const existing = fs.readFileSync(API_TOKEN_FILE, 'utf8').trim();
+    if (/^[a-f0-9]{64}$/i.test(existing)) return existing;
+  } catch (_) {}
+  fs.mkdirSync(DATA_DIR, { recursive: true });
+  const token = crypto.randomBytes(32).toString('hex');
+  fs.writeFileSync(API_TOKEN_FILE, token, { mode: 0o600 });
+  try { fs.chmodSync(API_TOKEN_FILE, 0o600); } catch (_) {}
+  return token;
+}
+
+const API_TOKEN = ensureApiToken();
 
 // 简单 semver 比较：a > b → 1，a < b → -1，相等 → 0（忽略预发布后缀）
 function semverCompare(a, b) {
@@ -165,10 +183,13 @@ function checkUpdate(force) {
         : (assets.find((a) => /\.dmg$/i.test(a.name || '')) || null);
       updateState.dmgUrl = asset ? asset.browser_download_url : null;
       updateState.dmgSize = asset ? asset.size : 0;
+      updateState.sha256 = asset && /^sha256:[a-f0-9]{64}$/i.test(asset.digest || '')
+        ? String(asset.digest).slice(7).toLowerCase()
+        : parseSha256(updateState.notes);
       updateState.checkedAt = Date.now();
       updateState.status = 'idle';
       updateState.message = updateState.hasUpdate ? '发现新版本 v' + latest : '已是最新版本';
-      try { fs.writeFileSync(UPDATE_CHECK_CACHE, JSON.stringify({ latest, hasUpdate: updateState.hasUpdate, dmgUrl: updateState.dmgUrl, dmgSize: updateState.dmgSize, notes: updateState.notes, checkedAt: updateState.checkedAt })); } catch (_) {}
+      try { fs.writeFileSync(UPDATE_CHECK_CACHE, JSON.stringify({ latest, hasUpdate: updateState.hasUpdate, dmgUrl: updateState.dmgUrl, dmgSize: updateState.dmgSize, sha256: updateState.sha256, notes: updateState.notes, checkedAt: updateState.checkedAt })); } catch (_) {}
       log(`[update] 检查完成: latest=${latest} hasUpdate=${updateState.hasUpdate} (current=${DAEMON_VERSION})`);
       return updateState;
     })
@@ -183,6 +204,7 @@ function checkUpdate(force) {
         updateState.latest = c.latest;
         updateState.hasUpdate = !!c.hasUpdate;
         updateState.dmgUrl = c.dmgUrl;
+        updateState.sha256 = c.sha256 || null;
         updateState.notes = c.notes;
         updateState.checkedAt = c.checkedAt || Date.now();
       } catch (_) {}
@@ -199,8 +221,9 @@ function downloadUpdate() {
   if (fs.existsSync(target)) {
     // 已有同版本文件：直接校验后复用
     const digest = sha256File(target);
-    const expect = parseSha256(updateState.notes);
-    if (!expect || digest === expect) {
+    const expect = updateState.sha256 || parseSha256(updateState.notes);
+    if (!expect) return Promise.reject(new Error('Release 未提供 SHA-256，已拒绝安装未校验更新'));
+    if (digest === expect) {
       updateState.downloaded = true;
       updateState.progress = 100;
       updateState.status = 'idle';
@@ -238,8 +261,15 @@ function downloadUpdate() {
         updateState.status = 'verifying';
         updateState.message = '校验安装包…';
         const digest = sha256File(target);
-        const expect = parseSha256(updateState.notes);
-        if (expect && digest !== expect) {
+        const expect = updateState.sha256 || parseSha256(updateState.notes);
+        if (!expect) {
+          fs.unlinkSync(target);
+          updateState.status = 'error';
+          updateState.error = 'Release 未提供 SHA-256';
+          updateState.message = '缺少校验值，已拒绝安装';
+          return reject(new Error('Release 未提供 SHA-256，已拒绝安装未校验更新'));
+        }
+        if (digest !== expect) {
           fs.unlinkSync(target);
           updateState.status = 'error';
           updateState.error = 'SHA-256 校验失败';
@@ -248,7 +278,7 @@ function downloadUpdate() {
         }
         updateState.downloaded = true;
         updateState.status = 'idle';
-        updateState.message = '安装包已就绪' + (expect ? '（校验通过）' : '（未校验）');
+        updateState.message = '安装包已就绪（SHA-256 校验通过）';
         log(`[update] 下载完成 ${target} sha256=${digest}`);
         resolve(target);
       });
@@ -577,22 +607,25 @@ function resolveWorkBuddyBinary() {
   // 1) 显式指定（launcher/install 传入最可靠）
   const envBin = tryFile(process.env.WBSWITCH_WORKBUDDY_BIN);
   if (envBin) return (wbBinaryCache = envBin);
-  // 2) 运行中的 WorkBuddy 进程 Path（最权威：多实例共享同一 exe）
+  // 2) 运行中的 WorkBuddy / WorkBuddyAI 进程 Path（最权威）
   try {
-    const out = psCmd('Get-Process WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path');
+    const out = psCmd('Get-Process WorkBuddyAI,WorkBuddy -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Path');
     const p = out.trim().split(/\r?\n/).filter(Boolean).pop();
     const hit = tryFile(p);
     if (hit) return (wbBinaryCache = hit);
   } catch (_) {}
-  // 3) 注册表卸载项（DisplayIcon = "D:\xxx\WorkBuddy.exe,0" 取逗号前）
+  // 3) 注册表卸载项（DisplayIcon 优先；仅有 InstallLocation 时兼容 WorkBuddyAI.exe / WorkBuddy.exe）
   try {
-    const out = psCmd("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | Select-Object -First 1 DisplayIcon,InstallLocation | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ Join-Path $_.InstallLocation 'WorkBuddy.exe' } }");
+    const out = psCmd("$k=@('HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKLM:\\SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*','HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall\\*'); Get-ItemProperty $k -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName -match 'WorkBuddy|CodeBuddy' } | Select-Object -First 1 DisplayIcon,InstallLocation | ForEach-Object { if($_.DisplayIcon){ ($_.DisplayIcon -replace ',.*$','').Trim() } elseif($_.InstallLocation){ $ai=Join-Path $_.InstallLocation 'WorkBuddyAI.exe'; $legacy=Join-Path $_.InstallLocation 'WorkBuddy.exe'; if(Test-Path $ai){$ai}else{$legacy} } }");
     const p = out.trim().split(/\r?\n/).filter(Boolean).pop();
     const hit = tryFile(p);
     if (hit) return (wbBinaryCache = hit);
   } catch (_) {}
   // 4) 常见路径兜底（含探测机实际安装位）
   const cands = [
+    path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+    path.join(process.env.ProgramFiles || '', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
+    path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddyAI', 'WorkBuddyAI.exe'),
     path.join(process.env.LOCALAPPDATA || '', 'Programs', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env.ProgramFiles || '', 'WorkBuddy', 'WorkBuddy.exe'),
     path.join(process.env['ProgramFiles(x86)'] || '', 'WorkBuddy', 'WorkBuddy.exe'),
@@ -609,6 +642,8 @@ function resolveWorkBuddyBinary() {
 function quitWorkBuddy() {
   return new Promise((resolve) => {
     if (IS_WIN) {
+      const bin = resolveWorkBuddyBinary();
+      const imageName = path.basename(bin || '') || 'WorkBuddy.exe';
       let done = false;
       const finish = () => { if (!done) { done = true; resolve(); } };
       const run = (args) => {
@@ -616,8 +651,8 @@ function quitWorkBuddy() {
         p.on('error', finish);
         p.on('exit', () => setTimeout(finish, 700));
       };
-      run(['/IM', 'WorkBuddy.exe']);
-      setTimeout(() => { if (!done) run(['/F', '/T', '/IM', 'WorkBuddy.exe']); }, 2500);
+      run(['/IM', imageName]);
+      setTimeout(() => { if (!done) run(['/F', '/T', '/IM', imageName]); }, 2500);
       setTimeout(finish, 8000); // 极端兜底，绝不悬挂
       return;
     }
@@ -657,9 +692,10 @@ function relaunchWorkBuddy() {
   return new Promise((resolve, reject) => {
     if (IS_WIN) {
       const bin = resolveWorkBuddyBinary();
-      if (!bin) return reject(new Error('未找到 WorkBuddy.exe（可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定）'));
-      log(`[logout] 以 --remote-debugging-port=9222 重启 WorkBuddy: ${bin}`);
-      const child = spawn(bin, ['--remote-debugging-port=9222'], { detached: true, stdio: 'ignore', windowsHide: true });
+      if (!bin) return reject(new Error('未找到 WorkBuddy/WorkBuddyAI 可执行文件（可用环境变量 WBSWITCH_WORKBUDDY_BIN 指定）'));
+      const port = CDP_PORT_HINT || cdp.port || 9222;
+      log(`[logout] 以 --remote-debugging-port=${port} 重启 WorkBuddy: ${bin}`);
+      const child = spawn(bin, ['--remote-debugging-port=' + port], { detached: true, stdio: 'ignore', windowsHide: true });
       child.on('error', (e) => reject(e));
       child.unref();
       return resolve();
@@ -944,6 +980,7 @@ function injectWidget(reason) {
   }
   // 组件内通过 fetch 调用本机 API，注入时写入实际端口
   script = script.replace(/__WBS_API__/g, `http://${HOST}:${ACTUAL_PORT}`);
+  script = script.replace(/__WBS_TOKEN__/g, API_TOKEN);
   // 同步注入当前 daemon 版本号（inject.js 顶部的 __WBS_VERSION__ 占位符会在面板「关于」页直接展示，
   // 这样版本升级后不需要改 inject.js、面板永远显示 daemon 的真实版本）
   script = script.replace(/__WBS_VERSION__/g, DAEMON_VERSION);
@@ -968,8 +1005,17 @@ function injectWidget(reason) {
 /* ================= 本地 Web 服务 ================= */
 
 
-// ===== SESSIONS_API_MARK：会话管理（读 WorkBuddy workbuddy.db）=====
-const SESSIONS_DB = path.join(os.homedir(), '.workbuddy', 'workbuddy.db');
+// ===== SESSIONS_API_MARK：会话管理（读写 WorkBuddy workbuddy.db）=====
+// WorkBuddy AI 已把运行数据迁到 ~/.workbuddy-ai；旧产品线仍使用 ~/.workbuddy。
+function resolveWorkBuddyHome() {
+  if (process.env.WBSWITCH_WORKBUDDY_HOME) return process.env.WBSWITCH_WORKBUDDY_HOME;
+  const ai = path.join(os.homedir(), '.workbuddy-ai');
+  const legacy = path.join(os.homedir(), '.workbuddy');
+  if (fs.existsSync(path.join(ai, 'workbuddy.db')) || fs.existsSync(path.join(ai, 'app'))) return ai;
+  return legacy;
+}
+const WORKBUDDY_HOME = resolveWorkBuddyHome();
+const SESSIONS_DB = path.join(WORKBUDDY_HOME, 'workbuddy.db');
 // Windows：无系统 sqlite3 CLI，优先用 Node 内置 node:sqlite（需 --experimental-sqlite 启动，launcher/install 已统一加）
 let NodeSqlite = null;
 if (IS_WIN) { try { NodeSqlite = require('node:sqlite'); } catch (_) { NodeSqlite = null; } }
@@ -979,8 +1025,15 @@ function sqliteRun(sql) {
     return new Promise((resolve, reject) => {
       let db = null;
       try {
-        db = new NodeSqlite.DatabaseSync(SESSIONS_DB, { readOnly: true });
-        const rows = db.prepare(sql).all();
+        if (!fs.existsSync(SESSIONS_DB)) throw new Error('数据库不存在: ' + SESSIONS_DB);
+        db = new NodeSqlite.DatabaseSync(SESSIONS_DB);
+        const stmt = db.prepare(sql);
+        if (!/^\s*(SELECT|PRAGMA|WITH)\b/i.test(sql)) {
+          stmt.run();
+          db.close(); db = null;
+          return resolve('');
+        }
+        const rows = stmt.all();
         db.close(); db = null;
         if (!rows.length) return resolve('');
         const header = Object.keys(rows[0]).join('|');
@@ -1113,10 +1166,27 @@ function json(res, code, obj) {
 }
 
 function readBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (c) => (data += c));
+    let bytes = 0;
+    let tooLarge = false;
+    const maxBytes = 16 * 1024 * 1024;
+    req.on('data', (c) => {
+      if (tooLarge) return;
+      bytes += c.length;
+      if (bytes > maxBytes) {
+        tooLarge = true;
+        data = '';
+        return;
+      }
+      data += c;
+    });
     req.on('end', () => {
+      if (tooLarge) {
+        const e = new Error('请求体超过 16 MiB 限制');
+        e.statusCode = 413;
+        return reject(e);
+      }
       try {
         resolve(data ? JSON.parse(data) : {});
       } catch (_) {
@@ -1148,7 +1218,7 @@ const ASK_MODE_RULE = [
 ].join('\n');
 
 function workbuddySettingsPath() {
-  return path.join(os.homedir(), '.workbuddy', 'settings.json');
+  return path.join(WORKBUDDY_HOME, 'settings.json');
 }
 
 function readWorkbuddySettings() {
@@ -2264,10 +2334,15 @@ function handleApi(req, res) {
     res.writeHead(204, {
       'Access-Control-Allow-Origin': '*',
       'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Allow-Headers': 'Content-Type',
+      'Access-Control-Allow-Headers': 'Content-Type, X-WorkDaddy-Token',
+      'Access-Control-Allow-Private-Network': 'true',
       'Access-Control-Max-Age': '86400',
     });
     return res.end();
+  }
+
+  if (req.headers['x-workdaddy-token'] !== API_TOKEN) {
+    return json(res, 403, { ok: false, error: 'unauthorized' });
   }
 
   if (req.method === 'POST' && p === '/api/inject') {
@@ -2570,7 +2645,7 @@ function handleApi(req, res) {
         // 1) 取出源会话（含 cwd 用于定位消息文件）
         const srcRows = await sqliteQuery("SELECT id, cwd, user_id, title, custom_title, status, created_at, updated_at, last_activity_at, is_playground, source_mode, is_background_automation, mode, model, expert_id, expert_locale, expert_runtime_identity, expert_marketplace, permission_mode, use_sandbox_cli, project_id FROM sessions WHERE id IN (" + esc + ") AND deleted_at IS NULL;");
         if (!srcRows.length) return json(res, 404, { ok: false, error: '源会话不存在' });
-        const wbHome = path.join(os.homedir(), '.workbuddy');
+        const wbHome = WORKBUDDY_HOME;
         let copied = 0;
         for (const src of srcRows) {
           const newId = crypto.randomUUID();
@@ -2633,7 +2708,7 @@ function handleApi(req, res) {
         // 1) 真实删除 DB 记录（非软删）
         await sqliteRun("DELETE FROM sessions WHERE id IN (" + esc + ");");
         // 2) 删除本地消息文件（jsonl/目录/workspace/tasks/file-history/artifact-index）
-        const wbHome = path.join(os.homedir(), '.workbuddy');
+        const wbHome = WORKBUDDY_HOME;
         let filesRemoved = 0;
         for (const id of ids) filesRemoved += deleteSessionFiles(wbHome, id);
         log(`[sessions-delete] 已真实删除 ${ids.length} 个会话（DB + ${filesRemoved} 项文件）`);
@@ -2656,12 +2731,13 @@ function handleApi(req, res) {
   }
 
   // 打开 WorkBuddy 的 Chrome DevTools（绕开 chrome://inspect 404 + Electron CDP 拒绝带 Origin 的 WS）
-  // 前端页面从 9222 加载，ws 通过 daemon 代理（/devtools-proxy/<id>）中转去 Origin
+  // 前端页面从实际 CDP 端口加载，ws 通过带临时令牌的 daemon 代理中转去 Origin
   // 注意：必须 return Promise 立即返回，避免同步函数继续执行到 404 分支
   if (req.method === 'GET' && p === '/api/devtools-url') {
     return new Promise((resolve) => {
       const httpMod = require('http');
-      httpMod.get('http://127.0.0.1:9222/json/list', (r) => {
+      const cdpPort = cdp.port || CDP_PORT_HINT || 9222;
+      httpMod.get('http://127.0.0.1:' + cdpPort + '/json/list', (r) => {
         let d = '';
         r.on('data', (c) => (d += c));
         r.on('end', () => {
@@ -2671,7 +2747,8 @@ function handleApi(req, res) {
             const id = page ? page.id : (list.find((t) => t.type === 'page') || {}).id;
             if (!id) return resolve(json(res, 500, { ok: false, error: '未找到 WorkBuddy 页面 target' }));
             if (!wsLib) return resolve(json(res, 500, { ok: false, error: 'ws 代理库未加载，无法打开 DevTools' }));
-            const url = 'http://127.0.0.1:9222/devtools/inspector.html?ws=127.0.0.1:' + ACTUAL_PORT + '/devtools-proxy/' + id;
+            const wsTarget = '127.0.0.1:' + ACTUAL_PORT + '/devtools-proxy/' + id + '?token=' + encodeURIComponent(API_TOKEN);
+            const url = 'http://127.0.0.1:' + cdpPort + '/devtools/inspector.html?ws=' + encodeURIComponent(wsTarget);
             resolve(json(res, 200, { ok: true, url }));
           } catch (e) {
             resolve(json(res, 500, { ok: false, error: e.message }));
@@ -3218,7 +3295,16 @@ function restoreSleepMode() {
 
 function startServer() {
   const server = http.createServer((req, res) => {
-    if (req.url.startsWith('/api/')) return handleApi(req, res);
+    if (req.url.startsWith('/api/')) {
+      Promise.resolve(handleApi(req, res)).catch((e) => {
+        if (res.headersSent) {
+          try { res.end(); } catch (_) {}
+          return;
+        }
+        json(res, e && e.statusCode === 413 ? 413 : 500, { ok: false, error: e && e.message ? e.message : 'internal error' });
+      });
+      return;
+    }
     // 官方背景图静态服务：/wallpapers/<name>（供面板「主题」页缩略图预览）
     if (req.method === 'GET' && /^\/wallpapers\//.test(req.url)) {
       try {
@@ -3256,18 +3342,19 @@ function startServer() {
     res.end('not found');
   });
 
-  // DevTools WebSocket 代理：/devtools-proxy/<targetId> —— 浏览器前端连 daemon（不校验 Origin），
-  // daemon 用无 Origin 的 WebSocket 连 9222 转发（Electron CDP 拒绝带 Origin 的连接）
+  // DevTools WebSocket 代理：浏览器前端携带一次本机 API token，daemon 再用无 Origin 的 WS 连真实 CDP 端口。
   if (wsLib) {
     const { WebSocketServer } = wsLib;
     const wss = new WebSocketServer({ noServer: true });
     server.on('upgrade', (req, socket, head) => {
-      let pathname = '';
-      try { pathname = new URL(req.url, 'http://x').pathname; } catch (_) { socket.destroy(); return; }
-      const m = /^\/devtools-proxy\/([A-Za-z0-9]+)$/.exec(pathname);
+      let parsed;
+      try { parsed = new URL(req.url, 'http://x'); } catch (_) { socket.destroy(); return; }
+      if (parsed.searchParams.get('token') !== API_TOKEN) { socket.destroy(); return; }
+      const m = /^\/devtools-proxy\/([A-Za-z0-9_-]+)$/.exec(parsed.pathname);
       if (!m) { socket.destroy(); return; }
       wss.handleUpgrade(req, socket, head, (front) => {
-        const back = new WebSocket('ws://127.0.0.1:9222/devtools/page/' + m[1]);
+        const cdpPort = cdp.port || CDP_PORT_HINT || 9222;
+        const back = new WebSocket('ws://127.0.0.1:' + cdpPort + '/devtools/page/' + m[1]);
         let backReady = false;
         let keepAlive = null;
         const queue = [];
@@ -3330,7 +3417,13 @@ function startServer() {
   // 端口被占用则 +1 递增
   let port = UI_PORT_BASE;
   const tryListen = (attempt) => {
+    const onListening = () => {
+      ACTUAL_PORT = port;
+      log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
+    };
+    server.once('listening', onListening);
     server.once('error', (e) => {
+      server.removeListener('listening', onListening);
       if (e.code === 'EADDRINUSE' && attempt < 7) {
         port += 1;
         log(`[http] 端口占用，改用 ${port}`);
@@ -3340,10 +3433,7 @@ function startServer() {
         process.exit(1);
       }
     });
-    server.listen(port, HOST, () => {
-      ACTUAL_PORT = port;
-      log(`[http] Web 界面: http://${HOST}:${port}  (数据目录: ${DATA_DIR})`);
-    });
+    server.listen(port, HOST);
   };
   tryListen(0);
 }

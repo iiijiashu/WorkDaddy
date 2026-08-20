@@ -18,23 +18,27 @@ const path = require('path');
 
 const IS_WIN = process.platform === 'win32';
 
-// macOS: ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
-// Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\workbuddy-desktop.info（真机已确认）
-const AUTH_FILE =
-  process.env.WBSWITCH_AUTH_FILE ||
-  (IS_WIN
-    ? path.join(
-        process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local'),
-        'CodeBuddyExtension',
-        'Data',
-        'Public',
-        'auth',
-        'workbuddy-desktop.info'
-      )
-    : path.join(
-        os.homedir(),
-        'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
-      ));
+// WorkBuddy 的 authentication id 会随产品线变化：
+// 旧版桌面端使用 workbuddy-desktop，WorkBuddy AI 使用 workbuddy-desktop-ai。
+// 优先复用已经存在的认证文件；首次登录尚未创建文件时，再根据 WorkBuddyAI 安装情况选默认值。
+function defaultAuthFile() {
+  if (!IS_WIN) {
+    return path.join(
+      os.homedir(),
+      'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
+    );
+  }
+  const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
+  const authDir = path.join(localAppData, 'CodeBuddyExtension', 'Data', 'Public', 'auth');
+  const current = path.join(authDir, 'workbuddy-desktop-ai.info');
+  const legacy = path.join(authDir, 'workbuddy-desktop.info');
+  if (fs.existsSync(current)) return current;
+  if (fs.existsSync(legacy)) return legacy;
+  const workBuddyAi = path.join(localAppData, 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe');
+  return fs.existsSync(workBuddyAi) ? current : legacy;
+}
+
+const AUTH_FILE = process.env.WBSWITCH_AUTH_FILE || defaultAuthFile();
 
 function defaultDataDir() {
   // macOS: ~/Library/Application Support/WorkDaddy
@@ -56,8 +60,15 @@ function metaFile(dataDir) {
 function logFile(dataDir) {
   return path.join(dataDir, 'daemon.log');
 }
+function validateUid(uid) {
+  const value = String(uid || '');
+  if (!/^[A-Za-z0-9_-]{1,128}$/.test(value)) {
+    throw new Error('账号 uid 格式无效');
+  }
+  return value;
+}
 function backupPath(dataDir, uid) {
-  return path.join(accountsDir(dataDir), `${uid}.info`);
+  return path.join(accountsDir(dataDir), `${validateUid(uid)}.info`);
 }
 
 function ensureDirs(dataDir) {
@@ -252,6 +263,7 @@ module.exports = {
   metaFile,
   logFile,
   backupPath,
+  validateUid,
   ensureDirs,
   readAuthFile,
   updateMeta,
