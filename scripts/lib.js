@@ -2,12 +2,15 @@
  * WorkBuddy 多账号切换器 - 共享逻辑
  *
  * 原理：WorkBuddy 桌面端的登录信息保存在
- *   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info
- * 其中 account.uid 是用户唯一 ID。本插件把该文件按 <uid>.info 分文件备份到稳定目录，
- * 切换登录时把对应备份复制回原文件即可。
+ *   Windows: %LOCALAPPDATA%\CodeBuddyExtension\Data\Public\auth\<authenticationId>.info
+ *   macOS:   ~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/<authenticationId>.info
+ * 其中 <authenticationId> 由应用按登录渠道决定：旧版固定 workbuddy-desktop-ai，
+ * 5.4.x 腾讯云渠道登录会写成 Tencent-Cloud.coding-copilot.info。
+ * 本插件扫描该目录下所有渠道登录文件，按 account.uid 备份到稳定目录；
+ * 切换登录时把备份写回应用当前使用的登录文件。
  *
  * 环境变量（均可覆盖默认值）：
- *   WBSWITCH_AUTH_FILE  登录信息文件路径
+ *   WBSWITCH_AUTH_FILE  登录信息文件路径（显式指定后不再扫描目录，保持旧版行为）
  *   WBSWITCH_DATA_DIR   备份数据目录
  */
 'use strict';
@@ -25,13 +28,13 @@ function defaultAuthFile() {
   if (!IS_WIN) {
     return path.join(
       os.homedir(),
-      'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info'
+      'Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop-ai.info'
     );
   }
   const localAppData = process.env.LOCALAPPDATA || path.join(os.homedir(), 'AppData', 'Local');
-  const authDir = path.join(localAppData, 'CodeBuddyExtension', 'Data', 'Public', 'auth');
-  const current = path.join(authDir, 'workbuddy-desktop-ai.info');
-  const legacy = path.join(authDir, 'workbuddy-desktop.info');
+  const authDirPath = path.join(localAppData, 'CodeBuddyExtension', 'Data', 'Public', 'auth');
+  const current = path.join(authDirPath, 'workbuddy-desktop-ai.info');
+  const legacy = path.join(authDirPath, 'workbuddy-desktop.info');
   if (fs.existsSync(current)) return current;
   if (fs.existsSync(legacy)) return legacy;
   const workBuddyAi = path.join(localAppData, 'Programs', 'WorkBuddyAI', 'WorkBuddyAI.exe');
@@ -39,6 +42,89 @@ function defaultAuthFile() {
 }
 
 const AUTH_FILE = process.env.WBSWITCH_AUTH_FILE || defaultAuthFile();
+
+/** 登录信息目录：所有渠道的 <authenticationId>.info 都在这里 */
+function authDir() {
+  return path.dirname(AUTH_FILE);
+}
+
+/**
+ * 列出目录里所有渠道登录文件。
+ * 排除应用自己滚动的时间戳快照（<id>.<ISO 时间>.<pid>.<uuid>.info）与临时文件。
+ * 显式指定 WBSWITCH_AUTH_FILE 时只返回该文件（旧版单文件行为完全保留）。
+ */
+function listAuthFiles() {
+  if (process.env.WBSWITCH_AUTH_FILE) {
+    return fs.existsSync(AUTH_FILE) ? [AUTH_FILE] : [];
+  }
+  let names = [];
+  try {
+    names = fs.readdirSync(authDir());
+  } catch (_) {
+    return [];
+  }
+  const files = [];
+  for (const n of names) {
+    if (!/\.info$/i.test(n)) continue;
+    // 应用的时间戳快照（如 workbuddy-desktop-ai.2026-08-21T03-08-07-960Z.39252.<uuid>.info）
+    // 是历史副本而非活动登录文件，不参与备份/切换
+    if (/\.\d{4}-\d{2}-\d{2}T[\d-]+Z\./.test(n)) continue;
+    const f = path.join(authDir(), n);
+    try {
+      if (!fs.statSync(f).isFile()) continue;
+    } catch (_) {
+      continue;
+    }
+    files.push(f);
+  }
+  return files;
+}
+
+/** 读取并解析登录文件，返回 { json, account }；文件缺失/损坏/无 account.uid 时返回 null */
+function parseAuthFile(file) {
+  let json;
+  try {
+    json = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (_) {
+    return null;
+  }
+  if (!json || typeof json !== 'object') return null;
+  const acct = json.account || (Array.isArray(json.accounts) && json.accounts[0]) || null;
+  if (!acct || !acct.uid) return null;
+  return { json, account: acct };
+}
+
+/**
+ * 当前生效的登录文件：应用按渠道把登录态写进不同 <id>.info。
+ * 优先 account.lastLogin === true 且数据最新的一份；否则取
+ * lastRefreshTime/mtime 最新的。目录为空时回退旧版单文件解析
+ * （保持首次安装、尚未登录时的行为）。
+ */
+function currentAuthFile() {
+  if (process.env.WBSWITCH_AUTH_FILE) return AUTH_FILE;
+  const entries = [];
+  for (const f of listAuthFiles()) {
+    const parsed = parseAuthFile(f);
+    if (!parsed) continue;
+    let mtimeMs = 0;
+    try {
+      mtimeMs = fs.statSync(f).mtimeMs;
+    } catch (_) {}
+    entries.push({
+      file: f,
+      stamp: Number(parsed.json.auth && parsed.json.auth.lastRefreshTime) || mtimeMs,
+      lastLogin: parsed.account.lastLogin === true,
+    });
+  }
+  if (!entries.length) return AUTH_FILE;
+  // 最新数据优先；lastLogin 标记只在「与最新数据接近」的文件之间做决胜——
+  // 避免很久以前登录残留的 lastLogin:true 压过新渠道的会话
+  const newest = Math.max(...entries.map((e) => e.stamp));
+  const FRESH_WINDOW = 5 * 60 * 1000;
+  const fresh = entries.filter((e) => newest - e.stamp <= FRESH_WINDOW);
+  fresh.sort((a, b) => (b.lastLogin === a.lastLogin ? b.stamp - a.stamp : b.lastLogin ? 1 : -1));
+  return fresh[0].file;
+}
 
 function defaultDataDir() {
   // macOS: ~/Library/Application Support/WorkDaddy
@@ -80,9 +166,10 @@ function ensureDirs(dataDir) {
   }
 }
 
-/** 读取登录信息文件并抽取账号关键字段（不返回令牌内容） */
-function readAuthFile() {
-  const raw = fs.readFileSync(AUTH_FILE, 'utf8');
+/** 读取登录信息文件并抽取账号关键字段（不返回令牌内容；默认读当前生效的渠道文件） */
+function readAuthFile(file) {
+  const target = file || currentAuthFile();
+  const raw = fs.readFileSync(target, 'utf8');
   const json = JSON.parse(raw);
   if (!json || typeof json !== 'object') {
     throw new Error('auth 文件不是有效的 JSON 对象');
@@ -98,6 +185,7 @@ function readAuthFile() {
     phone: acct.phoneNumber || '',
     type: acct.type || '',
     raw: json,
+    file: target,
   };
 }
 
@@ -125,20 +213,65 @@ function updateMeta(dataDir, info) {
   return meta;
 }
 
-/** 把当前登录信息备份到 accounts/<uid>.info（原子写入，0600） */
-function backupCurrent(dataDir, log = () => {}) {
-  ensureDirs(dataDir);
-  const info = readAuthFile();
-  const dest = backupPath(dataDir, info.uid);
+/** 把单个登录文件备份到 accounts/<uid>.info（原子写入，0600）。
+ *  已存在更新的备份时不降级覆盖（多渠道文件指向同一 uid 时避免旧快照回滚）。 */
+function backupAuthFile(dataDir, file, log = () => {}) {
+  const parsed = parseAuthFile(file);
+  if (!parsed) {
+    throw new Error('auth 文件无效或缺少 account.uid: ' + path.basename(file));
+  }
+  const { json, account: acct } = parsed;
+  const dest = backupPath(dataDir, acct.uid);
+  let stamp = 0;
+  try {
+    stamp = Number(json.auth && json.auth.lastRefreshTime) || Math.floor(fs.statSync(file).mtimeMs);
+  } catch (_) {}
+  try {
+    const old = JSON.parse(fs.readFileSync(dest, 'utf8'));
+    const oldStamp = Number(old.auth && old.auth.lastRefreshTime) || 0;
+    if (oldStamp > stamp) {
+      return { uid: acct.uid, nickname: acct.nickname || '', uin: acct.uin || '', file, skipped: true };
+    }
+  } catch (_) {
+    /* 首次备份 */
+  }
   const tmp = dest + '.tmp';
-  fs.writeFileSync(tmp, fs.readFileSync(AUTH_FILE), { mode: 0o600 });
+  fs.writeFileSync(tmp, fs.readFileSync(file), { mode: 0o600 });
   fs.renameSync(tmp, dest);
   fs.chmodSync(dest, 0o600);
-  updateMeta(dataDir, info);
+  updateMeta(dataDir, {
+    uid: acct.uid,
+    nickname: acct.nickname || '',
+    uin: acct.uin || '',
+    phone: acct.phoneNumber || '',
+  });
   log(
-    `[sync] 已备份账号 ${info.nickname || info.uid} (${info.uid}) -> ${dest}`
+    `[sync] 已备份账号 ${acct.nickname || acct.uid} (${acct.uid}) <- ${path.basename(file)}`
   );
-  return info;
+  return { uid: acct.uid, nickname: acct.nickname || '', uin: acct.uin || '', file, skipped: false };
+}
+
+/** 备份目录里所有渠道登录文件（幂等），返回当前生效账号的信息 */
+function backupCurrent(dataDir, log = () => {}) {
+  ensureDirs(dataDir);
+  const files = listAuthFiles();
+  if (!files.length) {
+    throw new Error('未找到登录信息文件（' + authDir() + '）');
+  }
+  const current = currentAuthFile();
+  let result = null;
+  for (const f of files) {
+    try {
+      const info = backupAuthFile(dataDir, f, log);
+      if (!result || path.resolve(f) === path.resolve(current)) result = info;
+    } catch (e) {
+      log(`[sync] 备份 ${path.basename(f)} 失败: ${e.message}`);
+    }
+  }
+  if (!result) {
+    throw new Error('所有登录文件备份均失败');
+  }
+  return result;
 }
 
 /** 列出所有已备份账号（直接读备份文件提取展示字段，按最近刷新时间倒序） */
@@ -208,7 +341,25 @@ function deleteAccount(dataDir, uid) {
   return { deleted: deletedFile, uid };
 }
 
-/** 切换登录账号：把备份文件复制回登录信息文件（先校验 uid 匹配） */
+/** 从 auth JSON 的 accessToken 解析 JWT iss 来源域（realm，用于渠道匹配），失败返回 null */
+function authRealm(json) {
+  try {
+    const part = String((json && json.auth && json.auth.accessToken) || '').split('.')[1];
+    if (!part) return null;
+    const payload = JSON.parse(
+      Buffer.from(part.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf8')
+    );
+    const m = String(payload.iss || '').match(/^https?:\/\/[^/]+/i);
+    return m ? m[0] : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+/** 切换登录账号：把备份文件写回渠道匹配的登录文件（先校验 uid 匹配）。
+ *  渠道选择：优先写回「realm 与备份 token 一致」的现有渠道文件——
+ *  把 .ai realm 的账号写进腾讯云渠道文件（或反之）是否被 5.4.x 接受没有证据，
+ *  按 realm 回到原始渠道文件是最稳妥的选择；找不到匹配时才回退当前文件并告警。 */
 function switchTo(dataDir, uid, log = () => {}) {
   const src = backupPath(dataDir, uid);
   if (!fs.existsSync(src)) {
@@ -220,11 +371,37 @@ function switchTo(dataDir, uid, log = () => {}) {
   if (!acct || acct.uid !== uid) {
     throw new Error('备份文件校验失败：uid 不匹配，已中止切换');
   }
-  const tmp = AUTH_FILE + '.wbswitch.tmp';
+  const current = currentAuthFile();
+  const targetRealm = authRealm(json);
+  let target = null;
+  if (targetRealm) {
+    const currentParsed = parseAuthFile(current);
+    if (currentParsed && authRealm(currentParsed.json) === targetRealm) {
+      target = current;
+    } else {
+      const match = listAuthFiles().find((f) => {
+        const p = parseAuthFile(f);
+        return p && authRealm(p.json) === targetRealm;
+      });
+      if (match) {
+        target = match;
+        if (match !== current) {
+          log(`[switch] 目标账号 realm=${targetRealm}，写回其原始渠道文件 ${path.basename(match)}（当前渠道文件 realm 不匹配，不覆写）`);
+        }
+      }
+    }
+  }
+  if (!target) {
+    target = current;
+    if (targetRealm) {
+      log(`[switch] 警告：现有渠道文件均不匹配 realm=${targetRealm}，回退写入当前文件 ${path.basename(target)}——若切号后未生效请重新登录该账号`);
+    }
+  }
+  const tmp = target + '.wbswitch.tmp';
   try {
     fs.writeFileSync(tmp, raw, { mode: 0o600 });
-    fs.renameSync(tmp, AUTH_FILE);
-    fs.chmodSync(AUTH_FILE, 0o600);
+    fs.renameSync(tmp, target);
+    fs.chmodSync(target, 0o600);
   } catch (e) {
     // 沙箱环境（如从 WorkBuddy 托管后台运行）直接写系统目录会 EPERM。
     // macOS 回退：osascript 委托 GUI 会话复制（不涉及内容转义，只传路径）。
@@ -236,9 +413,9 @@ function switchTo(dataDir, uid, log = () => {}) {
     }
     log(`[switch] 直写失败(${e.code})，改用 osascript 委托写入`);
     const bridge = path.join(dataDir, '.auth-switch-bridge.tmp');
-    const authBridge = AUTH_FILE + '.wbswitch.tmp';
+    const authBridge = target + '.wbswitch.tmp';
     const bridgeQ = bridge.replace(/"/g, '\\"');
-    const authQ = AUTH_FILE.replace(/"/g, '\\"');
+    const authQ = target.replace(/"/g, '\\"');
     const tmpQ = authBridge.replace(/"/g, '\\"');
     try {
       // 1) 本进程写 bridge（数据目录可写）
@@ -252,13 +429,20 @@ function switchTo(dataDir, uid, log = () => {}) {
       throw new Error(`写入登录文件失败: ${(e2.message || e2).toString().slice(0, 200)}`);
     }
   }
-  log(`[switch] 已切换登录账号为 ${acct.nickname || uid} (${uid})`);
+  // 清掉应用自己的「已登出」标记（<file>.logged-out），否则应用会无视恢复的会话
+  try { fs.unlinkSync(target + '.logged-out'); } catch (_) {}
+  log(`[switch] 已切换登录账号为 ${acct.nickname || uid} (${uid}) -> ${path.basename(target)}`);
   return { uid: acct.uid, nickname: acct.nickname || '', uin: acct.uin || '' };
 }
 
 module.exports = {
   AUTH_FILE,
   defaultDataDir,
+  authDir,
+  listAuthFiles,
+  currentAuthFile,
+  parseAuthFile,
+  authRealm,
   accountsDir,
   metaFile,
   logFile,
@@ -267,6 +451,7 @@ module.exports = {
   ensureDirs,
   readAuthFile,
   updateMeta,
+  backupAuthFile,
   backupCurrent,
   listAccounts,
   switchTo,

@@ -262,10 +262,17 @@ async function ensureDaemon(nodeBin) {
     }
     log('等待超时，主动拉起 watchdog');
   }
-  // 启动 watchdog（它负责启动 daemon + 崩溃拉起）
+  // 启动 watchdog（它负责启动 daemon + 崩溃拉起）。
+  // WBSWITCH_HEAL_COLD_START：launcher 托管的会话里 WorkBuddy 就该处于 CDP 模式，
+  // 允许 daemon 冷启动自愈（WorkBuddy 在跑但从未连上调试端口时也能修复）
   if (!watchdogAlive()) {
     log('启动 watchdog: ' + nodeBin);
-    const child = spawn(nodeBin, [path.join(SCRIPTS_DIR, 'watchdog.js')], { detached: true, stdio: 'ignore', windowsHide: true });
+    const child = spawn(nodeBin, [path.join(SCRIPTS_DIR, 'watchdog.js')], {
+      detached: true,
+      stdio: 'ignore',
+      windowsHide: true,
+      env: Object.assign({}, process.env, { WBSWITCH_HEAL_COLD_START: '1' }),
+    });
     child.unref();
   }
   for (let i = 0; i < 30; i++) {
