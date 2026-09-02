@@ -57,7 +57,9 @@ const {
   authDir,
   listAuthFiles,
   currentAuthFile,
+  validateUid,
 } = require('./lib.js');
+const { classifyCheckinResult } = require('./checkin-result.js');
 
 const DATA_DIR = defaultDataDir();
 // 版本号：改动 daemon/inject/theme-patches/builtin 资产后递增，launcher 检测到运行中版本不一致会强制用 app 内置代码重启
@@ -393,15 +395,36 @@ function scheduleBackup(reason) {
 }
 
 // 目录监听：5.4.x 按登录渠道写不同 <authenticationId>.info（如 Tencent-Cloud.coding-copilot.info），
-// 必须监听整个 auth 目录才能感知新渠道登录/新增账号；标记与临时文件（.logged-out/.tmp）忽略
-try {
-  fs.watch(authDir(), (event, filename) => {
-    if (filename && !/\.info$/i.test(String(filename))) return;
-    scheduleBackup('file-change');
-  });
-} catch (e) {
-  log(`[sync] 登录目录监听不可用，退化为轮询: ${e.message}`);
+// 必须监听整个 auth 目录才能感知新渠道登录/新增账号；标记与临时文件（.logged-out/.tmp）忽略。
+// 必须挂 error 监听：目录被删/移动时 fs.watch 会 emit 'error'，无人监听 = uncaught exception 杀死 daemon
+let authWatcher = null;
+let authWatchFailures = 0;
+function startAuthDirWatch() {
+  try {
+    const w = fs.watch(authDir(), (event, filename) => {
+      if (filename && !/\.info$/i.test(String(filename))) return;
+      scheduleBackup('file-change');
+    });
+    authWatchFailures = 0;
+    authWatcher = w;
+    // 必须挂 error 监听：目录被删/移动时 fs.watch 会 emit 'error'，无人监听 = uncaught exception 杀死 daemon。
+    // 用闭包内的 w 比对，避免迟到的 error 误关重试后新建的健康 watcher
+    w.on('error', (e) => {
+      log('[sync] 登录目录监听异常: ' + (e && e.message ? e.message : e));
+      try { w.close(); } catch (_) {}
+      if (authWatcher === w) authWatcher = null;
+      authWatchFailures++;
+      const delay = Math.min(5000 * authWatchFailures, 60000);
+      setTimeout(() => { if (!authWatcher) startAuthDirWatch(); }, delay);
+    });
+  } catch (e) {
+    log(`[sync] 登录目录监听不可用，退化为轮询: ${e.message}`);
+    authWatchFailures++;
+    const delay = Math.min(5000 * authWatchFailures, 60000);
+    setTimeout(() => { if (!authWatcher) startAuthDirWatch(); }, delay);
+  }
 }
+startAuthDirWatch();
 // 兜底轮询：fs.watch 在部分环境可能丢事件；文件被移走（如"假退出登录"）时不应触发备份
 fs.watchFile(AUTH_FILE, { interval: WATCH_INTERVAL }, (cur, prev) => {
   if (!fs.existsSync(AUTH_FILE)) return;
@@ -506,6 +529,7 @@ async function connectCdp() {
       cdp.ws = ws;
       cdp.connected = true;
       cdp.everConnected = true;
+      cdpStableSince = Date.now();
       cdp.error = null;
       cdp.targetUrl = target.url || '';
       log(`[cdp] 已连接 WorkBuddy (port=${cdp.port}, target=${cdp.targetUrl})`);
@@ -549,6 +573,7 @@ async function connectCdp() {
     ws.onclose = () => {
       cdp.connected = false;
       cdp.ws = null;
+      cdpStableSince = 0;
       log('[cdp] 连接已断开，5 秒后重连');
     };
   });
@@ -626,6 +651,13 @@ const HEAL_COLD_START = process.env.WBSWITCH_HEAL_COLD_START === '1';
 let cdpLostAt = 0;
 let healSuppressedUntil = 0;
 let lastHealCheckAt = 0;
+// 滑动窗口防抖：healTimestamps 记录最近的自愈时刻。不能在 CDP 短暂恢复时清零——
+// 「自愈重启的 WorkBuddy 带着调试端口起来、随后又自重启丢端口」会让计数永远数不满，
+// 退化成每 4-5 分钟一次的无限强杀循环。连接成功不重置，靠 30 分钟窗口自然过期。
+let healTimestamps = [];
+let healBackoffRounds = 0;
+let healDisabled = false; // 连续多轮退避仍无效后停止自愈，等人工介入
+let cdpStableSince = 0; // CDP 持续连接的起点（onopen 置位 / onclose 清零），用于判断"真正恢复"
 
 function isWorkBuddyRunning() {
   return new Promise((resolve) => {
@@ -654,10 +686,18 @@ function isWorkBuddyRunning() {
 
 async function maybeHealCdp() {
   if (cdp.connected) {
+    // CDP 稳定连接超过 30 分钟视为真正恢复：重置退避轮次。否则几周后的旧账会把
+    // "连续 3 轮退避"凑满、永久禁用自愈
+    if (cdpStableSince && Date.now() - cdpStableSince > 30 * 60 * 1000 && (healBackoffRounds || healTimestamps.length)) {
+      healBackoffRounds = 0;
+      healTimestamps = [];
+      log('[heal] CDP 已稳定连接超过 30 分钟，重置自愈退避状态');
+    }
     cdpLostAt = 0;
     return;
   }
   if (!cdp.everConnected && !HEAL_COLD_START) return; // 冷启动且未开启冷自愈：不介入
+  if (healDisabled) return;
   const now = Date.now();
   if (!cdpLostAt) cdpLostAt = now;
   if (now - cdpLostAt < CDP_HEAL_GRACE_MS) return;
@@ -677,6 +717,23 @@ async function maybeHealCdp() {
     cdpLostAt = 0;
     return;
   }
+  // 30 分钟内自愈 ≥3 次 = 环境性问题（应用反复自重启/端口被占），退避 30 分钟；
+  // 连续 3 轮退避仍无效则彻底停止自愈（kill/restart 循环有损坏 workbuddy.db 的风险），
+  // 在 /api/status 暴露 heal 状态并依赖日志提示人工介入。
+  healTimestamps = healTimestamps.filter((t) => now - t < 30 * 60 * 1000);
+  if (healTimestamps.length >= 3) {
+    healBackoffRounds++;
+    if (healBackoffRounds >= 3) {
+      healDisabled = true;
+      log('[heal] 30 分钟内已自愈 3 次仍未稳定（连续 3 轮退避无效），已停止自动自愈。请从 WorkDaddy 图标重新启动修复，或检查 WorkBuddy 为何反复丢失调试端口');
+      cdpLostAt = 0;
+      return;
+    }
+    log(`[heal] 30 分钟内已自愈 ${healTimestamps.length} 次，退避 30 分钟（第 ${healBackoffRounds}/3 轮）`);
+    healSuppressedUntil = now + 30 * 60 * 1000;
+    cdpLostAt = 0;
+    return;
+  }
   log('[heal] WorkBuddy 在运行但 CDP 端口丢失（登录/切号后应用自重启会去掉调试参数），自动以调试模式重启');
   healSuppressedUntil = now + 3 * 60 * 1000;
   try {
@@ -687,6 +744,7 @@ async function maybeHealCdp() {
   } catch (e) {
     log('[heal] 自愈重启失败: ' + e.message);
   }
+  healTimestamps.push(now);
   cdpLostAt = 0;
 }
 
@@ -715,7 +773,10 @@ function diagnoseWorkbuddyNetwork() {
       }
       // Fake-IP：解析成功不代表可达，还要看代理核心是否接管了这条连接
       const s = net.connect({ host: addr, port: 443 });
+      let settled = false; // destroy 后可能再触发 error，防止 done 重复执行覆盖结论
       const done = (ok, extra) => {
+        if (settled) return;
+        settled = true;
         try { s.destroy(); } catch (_) {}
         networkDiag = Object.assign({ at: Date.now(), ok, kind: ok ? 'fake-ip' : 'fake-ip-unreachable', addr: String(addr) }, extra);
         if (!ok) log('[net-diag] ' + networkDiag.hint);
@@ -739,9 +800,11 @@ const WORKBUDDY_BINARY = IS_WIN ? '' : `${WORKBUDDY_APP}/Contents/MacOS/Electron
 // Windows：解析 WorkBuddy 可执行文件真实路径（安装盘可自定义，必须动态查）
 // 优先级：WBSWITCH_WORKBUDDY_BIN > 运行进程 Path > 注册表卸载项 > 常见路径
 let wbBinaryCache = null;
+let wbBinaryMissAt = 0; // 解析失败的负缓存：否则每次进程探测都要重跑 3 个 PowerShell 查询（每个 8s 超时）
 function resolveWorkBuddyBinary() {
   if (!IS_WIN) return WORKBUDDY_BINARY;
   if (wbBinaryCache) return wbBinaryCache;
+  if (wbBinaryMissAt && Date.now() - wbBinaryMissAt < 60000) return null;
   const tryFile = (p) => { try { if (p && fs.existsSync(p)) return p; } catch (_) {} return null; };
   const { execFileSync } = require('child_process');
   const psCmd = (cmd) => execFileSync('powershell', ['-NoProfile', '-Command', cmd], { encoding: 'utf8', timeout: 8000, windowsHide: true });
@@ -776,29 +839,64 @@ function resolveWorkBuddyBinary() {
     const hit = tryFile(c);
     if (hit) return (wbBinaryCache = hit);
   }
+  wbBinaryMissAt = Date.now();
   return null;
 }
 
 /** 退出 WorkBuddy：macOS 按应用路径精确匹配；Windows 按进程名 taskkill（先优雅 WM_CLOSE，超时强杀）。
- *  进程名按实际安装（WorkBuddyAI.exe）与旧版（WorkBuddy.exe）双兼容。 */
+ *  进程名按实际安装（WorkBuddyAI.exe）与旧版（WorkBuddy.exe）双兼容，并轮询确认进程已消失——
+ *  自愈/假退出都依赖「退出已完成」这一前提，旧实例未死透时新实例会撞单实例锁直接退出。 */
 function quitWorkBuddy() {
   return new Promise((resolve) => {
     if (IS_WIN) {
       const bin = resolveWorkBuddyBinary();
       const names = new Set(['WorkBuddyAI.exe', 'WorkBuddy.exe']);
       if (bin) names.add(path.basename(bin));
-      let done = false;
-      const finish = () => { if (!done) { done = true; resolve(); } };
-      const run = (args) => {
-        for (const name of names) {
-          const p = spawn('taskkill', args.concat(['/IM', name]), { stdio: 'ignore', windowsHide: true });
-          p.on('error', () => {});
-          p.on('exit', () => setTimeout(finish, 700));
+      const list = Array.from(names);
+      const { spawnSync } = require('child_process');
+      // 三态：true=确认存活 / false=确认已退出 / null=无法判定（tasklist 故障时不提前放行，走时间兜底）。
+      // 一次全量 tasklist 解析所有行（避免按名多次 spawnSync 阻塞事件循环）
+      const stillRunning = () => {
+        try {
+          const r = spawnSync('tasklist', ['/FO', 'CSV', '/NH'], { encoding: 'utf8', timeout: 4000, windowsHide: true });
+          if (r.error || r.status !== 0 || !(r.stdout || '').trim()) return null;
+          const out = (r.stdout || '').toLowerCase();
+          for (const name of list) {
+            if (out.includes('"' + name.toLowerCase() + '"')) return true;
+          }
+          return false;
+        } catch (_) {
+          return null;
         }
       };
-      run([]);
-      setTimeout(() => { if (!done) run(['/F', '/T']); }, 2500);
-      setTimeout(finish, 8000); // 极端兜底，绝不悬挂
+      const kill = (extra) => {
+        for (const name of list) {
+          const p = spawn('taskkill', extra.concat(['/IM', name]), { stdio: 'ignore', windowsHide: true });
+          p.on('error', () => {});
+        }
+      };
+      let done = false;
+      const finish = () => { if (!done) { done = true; resolve(); } };
+      kill([]); // 优雅 WM_CLOSE
+      const forceAt = Date.now() + 2500;
+      const poll = () => {
+        if (done) return;
+        if (stillRunning() === false) return finish();
+        if (Date.now() >= forceAt) {
+          kill(['/F', '/T']);
+          const hardDeadline = Date.now() + 4000;
+          const pollHard = () => {
+            if (done) return;
+            if (stillRunning() === false) return finish();
+            if (Date.now() >= hardDeadline) return finish(); // 无法确认也放行（调用方随后会重启）
+            setTimeout(pollHard, 300);
+          };
+          return setTimeout(pollHard, 300);
+        }
+        setTimeout(poll, 300);
+      };
+      setTimeout(poll, 400);
+      setTimeout(finish, 9000); // 极端兜底，绝不悬挂
       return;
     }
     // 先尝试正常退出（给 Electron 一次处理机会），再强制 kill
@@ -1002,11 +1100,7 @@ const CHECKIN_HOSTS = [
   'https://www.codebuddy.cn',
 ];
 const CHECKIN_PATHS = ['/billing/meter/daily-checkin', '/v2/billing/meter/daily-checkin'];
-// 10001 的语义必须按服务端文案区分：同一 code 既可能表示「今日已签」，
-// 也可能表示「签到活动未开启或已过期」（实测 .ai 域返回 HTTP 400 + 10001）。
-// 把后者记成成功会让当天缓存假成功、不再重试——面板永远显示"已签"。
-const CHECKIN_INACTIVE_MESSAGE = /未开启|未开始|未开放|已过期|无.*活动|活动.*(?:结束|关闭|暂停)/i;
-const CHECKIN_ALREADY_MESSAGE = /已签到|已领取|已经.*(?:签到|领取)|重复签到|already/i;
+// 10001 的语义分类（已签 vs 无活动）在 ./checkin-result.js，配套单元测试见 scripts/test/
 
 /** 解析 JWT payload 的 iss 来源域（如 https://www.workbuddy.ai），失败返回 null */
 function tokenIssuerOrigin(accessToken) {
@@ -1095,11 +1189,12 @@ async function dailyCheckin(accessToken) {
       }
       let o = {};
       try { o = JSON.parse(text); } catch (_) {}
-      const code = o.code;
       const msg = String(o.msg || o.message || '');
-      const inactive = CHECKIN_INACTIVE_MESSAGE.test(msg);
-      const already = code === 10001 && !inactive && CHECKIN_ALREADY_MESSAGE.test(msg);
-      const ok = already || (!inactive && r.ok && (code === 0 || code === undefined || code === null));
+      const cls = classifyCheckinResult({ httpOk: r.ok, code: o.code, message: msg });
+      const code = cls.code;
+      const inactive = cls.inactive;
+      const already = cls.already;
+      const ok = cls.ok;
       if (ok) return { ok, already, code, message: msg || 'ok', url };
       const reason = inactive ? 'checkin-no-activity' : (r.status === 401 ? 'checkin-unauthorized' : 'checkin-http-error');
       const failMsg = inactive ? '今日无签到活动' : (r.status === 401 ? '登录身份过期' : 'HTTP ' + r.status);
@@ -2440,6 +2535,8 @@ async function fetchResource(accessToken, body, host) {
       'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36',
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(12000),
+    redirect: 'manual',
   });
   const text = await r.text();
   let o;
@@ -2616,11 +2713,15 @@ function handleApi(req, res) {
   // 方便登录新账号；之后可用「恢复登录」或面板切回备份账号。
   if (req.method === 'POST' && p === '/api/logout') {
     return (async () => {
+      const intentFile = path.join(DATA_DIR, 'logout-intent.json');
       try {
         let quit = false;
         let relaunched = false;
         const removed = [];
+        const failed = [];
         healSuppressedUntil = Date.now() + 5 * 60 * 1000; // 自愈不要和假退出的重启打架
+        // 写登出意图：本操作是多步非事务（退出→删除→重启），daemon 中途被 watchdog 拉起时按此续做
+        try { fs.writeFileSync(intentFile, JSON.stringify({ at: Date.now() }), { mode: 0o600 }); } catch (_) {}
         try {
           // 必须先退宿主再删文件：优雅退出会把内存会话写回登录文件
           await quitWorkBuddy();
@@ -2631,22 +2732,30 @@ function handleApi(req, res) {
         }
         for (const f of listAuthFiles()) {
           try {
-            fs.writeFileSync(f + '.logged-out', new Date().toISOString(), { mode: 0o600 });
             fs.unlinkSync(f);
-            fs.unlinkSync(f + '.logged-out');
             removed.push(path.basename(f));
           } catch (e) {
-            log(`[logout] 删除 ${path.basename(f)} 失败: ${e.message}`);
+            // 删除失败（文件被占用等）：写应用自己的 .logged-out 标记兜底——应用会无视该会话
+            try {
+              fs.writeFileSync(f + '.logged-out', new Date().toISOString(), { mode: 0o600 });
+              log(`[logout] ${path.basename(f)} 删除失败（${e.message}），已写 .logged-out 标记兜底`);
+            } catch (_) {}
+            failed.push(path.basename(f));
           }
         }
-        log(`[logout] 假退出：已删除 ${removed.length} 个渠道登录文件（token 仍保留在备份里）`);
+        if (removed.length || failed.length) {
+          log(`[logout] 假退出：已删除 ${removed.length} 个渠道登录文件${failed.length ? `，${failed.length} 个失败` : ''}（token 仍保留在备份里）`);
+        } else {
+          log('[logout] 假退出：当前无渠道登录文件');
+        }
+        try { fs.unlinkSync(intentFile); } catch (_) {}
         try {
           await relaunchWorkBuddy();
           relaunched = true;
         } catch (e) {
           log(`[logout] 重启 WorkBuddy 失败: ${e.message}`);
         }
-        return json(res, 200, { ok: true, quit, relaunched, removed });
+        return json(res, 200, { ok: failed.length === 0, quit, relaunched, removed, failed });
       } catch (e) {
         return json(res, 500, { ok: false, error: e.message });
       }
@@ -2677,6 +2786,7 @@ function handleApi(req, res) {
       authFile: currentAuthFile(),
       authFiles: listAuthFiles(),
       network: networkDiag,
+      heal: { disabled: healDisabled, healsRecent: healTimestamps.length, backoffRounds: healBackoffRounds },
     });
   }
 
@@ -2700,6 +2810,11 @@ function handleApi(req, res) {
     return readBody(req).then(async (body) => {
       const uid = (body.uid || '').trim();
       if (!uid) return json(res, 400, { ok: false, error: '缺少 uid' });
+      try {
+        validateUid(uid); // 防路径穿越：uid 直接拼进备份文件路径
+      } catch (e) {
+        return json(res, 400, { ok: false, error: e.message });
+      }
       try {
         const file = path.join(DATA_DIR, 'accounts', `${uid}.info`);
         if (!fs.existsSync(file)) return json(res, 404, { ok: false, error: '账号备份不存在' });
@@ -3671,6 +3786,26 @@ function startServer() {
 const DAEMON_LOCK_FILE = path.join(DATA_DIR, '.daemon.lock');
 let daemonLockFd = null;
 
+/** 探测 PID 对应进程：'node'（属主存活）/ 'other'（PID 被复用）/ 'dead' / null（无法判定） */
+function probeProcess(pid) {
+  if (!IS_WIN) {
+    try { process.kill(pid, 0); return 'node'; } catch (e) { return e && e.code === 'EPERM' ? null : 'dead'; }
+  }
+  try {
+    const { spawnSync } = require('child_process');
+    const r = spawnSync('tasklist', ['/FI', 'PID eq ' + pid, '/FO', 'CSV', '/NH'], { encoding: 'utf8', timeout: 4000, windowsHide: true });
+    if (r.error || r.status !== 0 || !(r.stdout || '').trim()) return null;
+    const out = r.stdout || '';
+    if (/^error/i.test(out.trim())) return null; // tasklist 自身故障（权限/服务问题），无法判定
+    const m = out.match(/^"([^"]+?)"/m);
+    // tasklist 正常执行但没有 CSV 行 = 该 PID 不存在（本地区域化的"没有运行的任务匹配"提示）
+    if (!m) return 'dead';
+    return path.basename(m[1]).toLowerCase() === 'node.exe' ? 'node' : 'other';
+  } catch (_) {
+    return null;
+  }
+}
+
 function acquireDaemonLock() {
   const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString(), version: DAEMON_VERSION, buildId: DAEMON_BUILD_ID });
   for (let attempt = 0; attempt < 2; attempt++) {
@@ -3684,9 +3819,31 @@ function acquireDaemonLock() {
       let owner = null;
       try { owner = JSON.parse(fs.readFileSync(DAEMON_LOCK_FILE, 'utf8')); } catch (_) {}
       const ownerPid = Number(owner && owner.pid);
+      // 空/损坏 payload：属主可能刚 openSync 还没写入。锁文件刚创建（<5s）时保守退出；
+      // 陈旧的空锁按无属主清理重试
+      if (!owner || !(ownerPid > 0)) {
+        let mt = 0;
+        try { mt = fs.statSync(DAEMON_LOCK_FILE).mtimeMs; } catch (_) {}
+        if (mt && Date.now() - mt < 5000) {
+          process.stdout.write(`[${new Date().toISOString()}] [lock] 锁文件刚创建且无内容（属主正在启动），当前进程退出\n`);
+          return false;
+        }
+        try { fs.unlinkSync(DAEMON_LOCK_FILE); } catch (_) { return false; }
+        continue;
+      }
       let alive = false;
       if (ownerPid > 0 && ownerPid !== process.pid) {
-        try { process.kill(ownerPid, 0); alive = true; } catch (_) {}
+        // Windows PID 复用很快：仅凭 kill(pid,0) 会把复用 PID 的无关进程当属主（新 daemon 永远起不来），
+        // 也会把 EPERM 当已死（双 daemon）。用 tasklist 核对映像名。
+        const probe = probeProcess(ownerPid);
+        if (probe === 'node') alive = true;
+        else if (probe === null) {
+          // 无法判定（tasklist 失败等）：锁文件很新时保守视为存活
+          let mt = 0;
+          try { mt = fs.statSync(DAEMON_LOCK_FILE).mtimeMs; } catch (_) {}
+          alive = !!(mt && Date.now() - mt < 60 * 1000);
+        }
+        // 'other' / 'dead' → PID 已被复用或属主已退出 → 陈旧锁，走删除
       }
       if (alive) {
         process.stdout.write(`[${new Date().toISOString()}] [lock] 已有 daemon 运行 (pid=${ownerPid})，当前进程退出\n`);
@@ -3712,6 +3869,34 @@ function releaseDaemonLock() {
 
 ensureDirs(DATA_DIR);
 if (!acquireDaemonLock()) process.exit(0);
+// 假退出续做：上次 daemon 在「退出→删除→重启」中途被 watchdog 拉起时，残留的渠道登录文件
+// 会带着旧会话跳过登录页。检测到 10 分钟内的登出意图就补完（若应用还在运行先退出——
+// 与 /api/logout 相同前提：运行中的应用会在退出时把内存会话写回登录文件）
+(async () => {
+  try {
+    const intentFile = path.join(DATA_DIR, 'logout-intent.json');
+    if (!fs.existsSync(intentFile)) return;
+    let intent = null;
+    try { intent = JSON.parse(fs.readFileSync(intentFile, 'utf8')); } catch (_) {}
+    if (!intent || !intent.at || Date.now() - intent.at >= 10 * 60 * 1000) {
+      try { fs.unlinkSync(intentFile); } catch (_) {}
+      return;
+    }
+    try { await quitWorkBuddy(); } catch (_) {}
+    await sleep(800);
+    let resumed = 0;
+    for (const f of listAuthFiles()) {
+      try {
+        fs.unlinkSync(f);
+        resumed++;
+      } catch (_) {
+        try { fs.writeFileSync(f + '.logged-out', new Date().toISOString(), { mode: 0o600 }); } catch (_) {}
+      }
+    }
+    log(`[logout] 检测到未完成的假退出（daemon 中途重启），已续删 ${resumed} 个渠道登录文件`);
+    try { fs.unlinkSync(intentFile); } catch (_) {}
+  } catch (_) {}
+})();
 // 启动即全量备份一次：WorkBuddy 未运行（无 CDP 事件）、登录文件也无变化时，
 // 新渠道登录的账号（如 Tencent-Cloud.coding-copilot.info）也能在启动后立刻进面板
 try {

@@ -67,8 +67,9 @@ function listAuthFiles() {
   for (const n of names) {
     if (!/\.info$/i.test(n)) continue;
     // 应用的时间戳快照（如 workbuddy-desktop-ai.2026-08-21T03-08-07-960Z.39252.<uuid>.info）
-    // 是历史副本而非活动登录文件，不参与备份/切换
-    if (/\.\d{4}-\d{2}-\d{2}T[\d-]+Z\./.test(n)) continue;
+    // 是历史副本而非活动登录文件，不参与备份/切换。只要求含 ISO 日期段，不强制 Z 后缀
+    // （不同版本可能用本地时间命名），避免快照被当成活动渠道文件污染账号列表
+    if (/\.\d{4}-\d{2}-\d{2}T/.test(n)) continue;
     const f = path.join(authDir(), n);
     try {
       if (!fs.statSync(f).isFile()) continue;
@@ -315,8 +316,9 @@ function listAccounts(dataDir) {
     }
     return item;
   });
+  // lastRefreshTime 理论上是毫秒数字，但防御性强转：字符串时间戳相减会得到 NaN 导致排序失效
   return list.sort(
-    (a, b) => (b.lastRefreshTime || 0) - (a.lastRefreshTime || 0)
+    (a, b) => (Number(b.lastRefreshTime) || 0) - (Number(a.lastRefreshTime) || 0)
   );
 }
 
@@ -398,14 +400,29 @@ function switchTo(dataDir, uid, log = () => {}) {
     }
   }
   const tmp = target + '.wbswitch.tmp';
-  try {
-    fs.writeFileSync(tmp, raw, { mode: 0o600 });
-    fs.renameSync(tmp, target);
-    fs.chmodSync(target, 0o600);
-  } catch (e) {
+  // Windows：目标文件可能被 WorkBuddy 短暂占用（EPERM），做有限次同步重试
+  let writeErr = null;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      fs.writeFileSync(tmp, raw, { mode: 0o600 });
+      fs.renameSync(tmp, target);
+      fs.chmodSync(target, 0o600);
+      writeErr = null;
+      break;
+    } catch (e) {
+      writeErr = e;
+      try { fs.unlinkSync(tmp); } catch (_) {}
+      if (attempt < 2) {
+        // 同步睡眠 400ms（主线程阻塞可接受：低频操作）
+        try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 400); } catch (_) {}
+      }
+    }
+  }
+  if (writeErr) {
     // 沙箱环境（如从 WorkBuddy 托管后台运行）直接写系统目录会 EPERM。
     // macOS 回退：osascript 委托 GUI 会话复制（不涉及内容转义，只传路径）。
     // Windows：目录在 %LOCALAPPDATA% 用户可写区，直写失败即如实报错。
+    const e = writeErr;
     if (IS_WIN) {
       throw new Error(
         `写入登录文件失败(${e.code || ''}): ${(e.message || e).toString().slice(0, 200)}`

@@ -109,6 +109,20 @@ function portOpen(port) {
   });
 }
 
+// CDP 端口判定不能只看 TCP：无关进程占着 9222 时会把"已在调试模式"误判为成立。
+// 必须 /json/version 应答且 Browser 像 Chromium/Electron（WorkBuddy 的 CDP）才算数。
+async function cdpPortReady(port) {
+  if (!(await portOpen(port))) return false;
+  try {
+    const r = await httpGet(port, '/json/version');
+    if (!r || r.status !== 200) return false;
+    const info = JSON.parse(r.body || '{}');
+    return /Chrome|Chromium|Electron|Edge|Headless/i.test(String(info.Browser || ''));
+  } catch (_) {
+    return false;
+  }
+}
+
 function readApiToken() {
   try { return fs.readFileSync(path.join(DATA_DIR, 'api-token'), 'utf8').trim(); } catch (_) { return ''; }
 }
@@ -349,7 +363,7 @@ async function injectNow() {
   }
 
   // 已在 CDP 模式 → 幂等注入
-  if (await portOpen(CDP_PORT)) {
+  if (await cdpPortReady(CDP_PORT)) {
     const injected = await injectNow();
     if (!injected) {
       log('WorkBuddy 已在调试模式，但 /api/inject 调用失败');
@@ -381,7 +395,7 @@ async function injectNow() {
   let ok = false;
   for (let i = 0; i < 20; i++) {
     await sleep(1000);
-    if (await portOpen(CDP_PORT)) { ok = true; break; }
+    if (await cdpPortReady(CDP_PORT)) { ok = true; break; }
   }
   if (ok) {
     await sleep(1500);
