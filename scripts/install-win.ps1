@@ -8,6 +8,13 @@ param(
 )
 
 $ErrorActionPreference = 'Continue'
+$appFull = [IO.Path]::GetFullPath($AppDir).TrimEnd('\')
+$rootFull = [IO.Path]::GetPathRoot($appFull).TrimEnd('\')
+if ([StringComparer]::OrdinalIgnoreCase.Equals($appFull, $rootFull)) {
+  Write-Host '错误：安装目录不能是驱动器根目录。'
+  exit 1
+}
+$AppDir = $appFull
 $targetScripts = Join-Path $AppDir 'scripts'
 $dataDir = Join-Path $env:APPDATA 'WorkDaddy'
 
@@ -17,12 +24,16 @@ Write-Host '=============================================================='
 Write-Host ("  源目录   : " + $SrcDir)
 Write-Host ("  安装目录 : " + $AppDir)
 
-# 1) 覆盖升级前先停止旧 WorkDaddy 进程，避免 launcher.cmd 被旧交互窗口长期占用。
+# 1) 覆盖升级前停止属于当前安装目录的旧 WorkDaddy 进程。
 try {
   $pidFile = Join-Path $dataDir 'watchdog.pid'
-  if (Test-Path $pidFile) {
-    $wpid = [int]((Get-Content $pidFile -Raw).Trim())
-    if ($wpid -gt 0) { taskkill /F /T /PID $wpid 2>$null | Out-Null }
+  if (Test-Path -LiteralPath $pidFile -PathType Leaf) {
+    $watchdogPid = [int]((Get-Content -LiteralPath $pidFile -Raw).Trim())
+    $watchdog = Get-CimInstance Win32_Process -Filter "ProcessId=$watchdogPid" -ErrorAction SilentlyContinue
+    $expectedWatchdog = (Join-Path $targetScripts 'watchdog.js').ToLowerInvariant()
+    if ($watchdog -and $watchdog.CommandLine -and $watchdog.CommandLine.ToLowerInvariant().Contains($expectedWatchdog)) {
+      taskkill /F /T /PID $watchdogPid 2>$null | Out-Null
+    }
   }
 } catch {}
 try {
@@ -33,48 +44,55 @@ try {
 } catch {}
 Start-Sleep -Milliseconds 500
 
-# 2) 镜像复制（排除开发/临时文件；node_modules/ws 随包带入）。
-#    安装目录由 WorkDaddy 独占管理，使用 /MIR 可清理旧版本残留文件，避免混跑旧脚本。
+# 2) 镜像复制（目标固定为 <AppDir>\scripts，清理旧版本残留）。
 if (-not (Test-Path (Join-Path $SrcDir 'daemon.js'))) {
   Write-Host '错误：源目录中找不到 daemon.js，请从仓库 scripts/ 目录运行本脚本。'
   exit 1
 }
 New-Item -ItemType Directory -Force -Path $targetScripts | Out-Null
-robocopy $SrcDir $targetScripts /MIR /R:3 /W:1 /XF *.log .DS_Store /XD win\probe
-$rc = $LASTEXITCODE
-if ($rc -ge 8) {
-  Write-Host "复制失败（robocopy=$rc）"
-  exit 2
+$sourceFull = [IO.Path]::GetFullPath($SrcDir).TrimEnd('\')
+$targetFull = [IO.Path]::GetFullPath($targetScripts).TrimEnd('\')
+if ([StringComparer]::OrdinalIgnoreCase.Equals($sourceFull, $targetFull)) {
+  # 从已安装目录重复运行安装脚本时，源和目标相同；robocopy 会尝试覆盖正在执行的脚本，
+  # 在 Windows 上容易出现“文件正被另一个进程使用”。此时只需继续执行后续注册/快捷方式步骤。
+  Write-Host '  源目录与安装目录相同，跳过自拷贝。'
+} else {
+  robocopy $SrcDir $targetScripts /MIR /XF *.log .DS_Store /XD win\probe /R:3 /W:1
+  $rc = $LASTEXITCODE
+  if ($rc -ge 8) {
+    Write-Host "复制失败（robocopy=$rc）"
+    exit 2
+  }
 }
 
 # 3) 数据目录
 New-Item -ItemType Directory -Force -Path (Join-Path $dataDir 'accounts') | Out-Null
 
-# 3.5) Logo 图标：随安装复制到安装目录根（桌面快捷方式用），源在 scripts 同级的 WorkDaddy.ico
+# 2.5) Logo 图标：随安装复制到安装目录根（桌面快捷方式用），源在 scripts 同级的 WorkDaddy.ico
 $logoIcoSrc = Join-Path $SrcDir 'WorkDaddy.ico'
 $logoIco = Join-Path $AppDir 'WorkDaddy.ico'
 if (Test-Path $logoIcoSrc) {
   try { Copy-Item $logoIcoSrc $logoIco -Force; Write-Host ('  图标复制 : ' + $logoIco) } catch {}
 }
 
-# 4) 创建/迁移静默入口（桌面快捷方式 + HKCU Run）
+# 4) 创建/迁移静默入口（桌面快捷方式 + HKCU Run）。
 $launcher = Join-Path $targetScripts 'launcher.cmd'
-$hiddenLauncher = Join-Path $targetScripts 'launch-hidden.vbs'
-$wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+$launcherVbs = Join-Path $targetScripts 'launcher-hidden.vbs'
 $repairEntrypoints = Join-Path $targetScripts 'repair-entrypoints.ps1'
 try {
-  if (-not (Test-Path $repairEntrypoints)) { throw 'repair-entrypoints.ps1 不存在' }
+  if (-not (Test-Path -LiteralPath $repairEntrypoints -PathType Leaf)) { throw 'repair-entrypoints.ps1 不存在' }
   & $repairEntrypoints -AppDir $AppDir
 } catch {
-  Write-Host ('  静默入口创建失败（可忽略，可手动运行 launcher.cmd --interactive）: ' + $_.Exception.Message)
+  Write-Host ('  静默入口创建失败（可手动运行 launcher.cmd）: ' + $_.Exception.Message)
 }
 
-# 5) 启动（daemon + 以 CDP 模式重启 WorkBuddy + 注入）
+# 5) 启动（daemon + 以 CDP 模式重启 WorkBuddy + 注入）。
 Write-Host '  正在启动 WorkDaddy（如果 WorkBuddy 正在运行，会重启它以开启调试模式）...'
-if (Test-Path $hiddenLauncher) {
-  Start-Process -FilePath $wscript -ArgumentList @('//B', '//Nologo', $hiddenLauncher) -WindowStyle Hidden
+if (Test-Path -LiteralPath $launcherVbs -PathType Leaf) {
+  $wscript = Join-Path $env:WINDIR 'System32\wscript.exe'
+  Start-Process -FilePath $wscript -ArgumentList ('//B //Nologo "' + $launcherVbs + '"') -WorkingDirectory $targetScripts -WindowStyle Hidden
 } else {
-  Write-Host '  警告：launch-hidden.vbs 不存在，跳过自动启动（可手动运行 launcher.cmd --interactive）'
+  Write-Host '  警告：launcher-hidden.vbs 不存在，跳过自动启动（可手动运行 launcher.cmd）'
 }
 
 Write-Host '=============================================================='

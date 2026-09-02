@@ -7,7 +7,7 @@
  * 其中 <authenticationId> 由应用按登录渠道决定：旧版固定 workbuddy-desktop-ai，
  * 5.4.x 腾讯云渠道登录会写成 Tencent-Cloud.coding-copilot.info。
  * 本插件扫描该目录下所有渠道登录文件，按 account.uid 备份到稳定目录；
- * 切换登录时把备份写回应用当前使用的登录文件。
+ * 切换登录时把备份写回与备份 token 同 realm 的渠道文件。
  *
  * 环境变量（均可覆盖默认值）：
  *   WBSWITCH_AUTH_FILE  登录信息文件路径（显式指定后不再扫描目录，保持旧版行为）
@@ -20,6 +20,25 @@ const os = require('os');
 const path = require('path');
 
 const IS_WIN = process.platform === 'win32';
+
+const PLATFORM_DATA_DIR = IS_WIN
+  ? path.join(
+      process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'),
+      'WorkDaddy'
+    )
+  : path.join(os.homedir(), 'Library', 'Application Support', 'WorkDaddy');
+// macOS 旧品牌目录：旧版 launchd 可能把 WBSWITCH_DATA_DIR 设成 HelloBuddy
+const LEGACY_DATA_DIR = IS_WIN
+  ? null
+  : path.join(os.homedir(), 'Library', 'Application Support', 'HelloBuddy');
+
+function samePath(a, b) {
+  return !!a && !!b && path.resolve(a) === path.resolve(b);
+}
+
+function isLegacyDataDir(dataDir) {
+  return !IS_WIN && samePath(dataDir, LEGACY_DATA_DIR);
+}
 
 // WorkBuddy 的 authentication id 会随产品线变化：
 // 旧版桌面端使用 workbuddy-desktop，WorkBuddy AI 使用 workbuddy-desktop-ai。
@@ -97,9 +116,9 @@ function parseAuthFile(file) {
 
 /**
  * 当前生效的登录文件：应用按渠道把登录态写进不同 <id>.info。
- * 优先 account.lastLogin === true 且数据最新的一份；否则取
- * lastRefreshTime/mtime 最新的。目录为空时回退旧版单文件解析
- * （保持首次安装、尚未登录时的行为）。
+ * 最新数据优先；lastLogin 标记只在「与最新数据接近」的文件之间做决胜——
+ * 避免很久以前登录残留的 lastLogin:true 压过新渠道的会话。
+ * 目录为空时回退旧版单文件解析（保持首次安装、尚未登录时的行为）。
  */
 function currentAuthFile() {
   if (process.env.WBSWITCH_AUTH_FILE) return AUTH_FILE;
@@ -118,8 +137,6 @@ function currentAuthFile() {
     });
   }
   if (!entries.length) return AUTH_FILE;
-  // 最新数据优先；lastLogin 标记只在「与最新数据接近」的文件之间做决胜——
-  // 避免很久以前登录残留的 lastLogin:true 压过新渠道的会话
   const newest = Math.max(...entries.map((e) => e.stamp));
   const FRESH_WINDOW = 5 * 60 * 1000;
   const fresh = entries.filter((e) => newest - e.stamp <= FRESH_WINDOW);
@@ -130,12 +147,10 @@ function currentAuthFile() {
 function defaultDataDir() {
   // macOS: ~/Library/Application Support/WorkDaddy
   // Windows: %APPDATA%\WorkDaddy
-  return (
-    process.env.WBSWITCH_DATA_DIR ||
-    (IS_WIN
-      ? path.join(process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'WorkDaddy')
-      : path.join(os.homedir(), 'Library', 'Application Support', 'WorkDaddy'))
-  );
+  // 旧版 launchd 可能把 WBSWITCH_DATA_DIR 设成 HelloBuddy；新版本始终落到 WorkDaddy，
+  // 避免旧服务被新 daemon 拉起后继续写入旧目录。
+  const configured = process.env.WBSWITCH_DATA_DIR;
+  return configured && !isLegacyDataDir(configured) ? configured : PLATFORM_DATA_DIR;
 }
 
 function accountsDir(dataDir) {
@@ -158,7 +173,57 @@ function backupPath(dataDir, uid) {
   return path.join(accountsDir(dataDir), `${validateUid(uid)}.info`);
 }
 
-function ensureDirs(dataDir) {
+/**
+ * 兼容旧版账号备份：把 HelloBuddy/accounts 中尚未存在于 WorkDaddy 的账号复制过来。
+ * 只对平台默认 WorkDaddy 目录执行，显式自定义数据目录不做隐式迁移。
+ * 源目录和文件均保留，重复调用幂等。（仅 macOS 存在旧目录，Windows 直接跳过）
+ */
+function migrateLegacyDataDir(dataDir, log = () => {}) {
+  if (IS_WIN || !samePath(dataDir, PLATFORM_DATA_DIR)) {
+    return { migrated: 0, skipped: 0, source: null, target: dataDir };
+  }
+
+  const sourceAccounts = accountsDir(LEGACY_DATA_DIR);
+  if (!fs.existsSync(sourceAccounts)) {
+    return { migrated: 0, skipped: 0, source: LEGACY_DATA_DIR, target: dataDir };
+  }
+
+  let names;
+  try {
+    names = fs
+      .readdirSync(sourceAccounts)
+      .filter((name) => name.endsWith('.info') && !name.endsWith('.tmp'));
+  } catch (_) {
+    return { migrated: 0, skipped: 0, source: LEGACY_DATA_DIR, target: dataDir };
+  }
+
+  const targetAccounts = accountsDir(dataDir);
+  fs.mkdirSync(targetAccounts, { recursive: true, mode: 0o700 });
+  let migrated = 0;
+  let skipped = 0;
+  for (const name of names) {
+    const source = path.join(sourceAccounts, name);
+    const target = path.join(targetAccounts, name);
+    if (fs.existsSync(target)) {
+      skipped += 1;
+      continue;
+    }
+    try {
+      fs.copyFileSync(source, target);
+      fs.chmodSync(target, 0o600);
+      migrated += 1;
+    } catch (e) {
+      log(`[migration] 迁移账号 ${name} 失败: ${e.message}`);
+    }
+  }
+  if (migrated) {
+    log(`[migration] 已从 ${LEGACY_DATA_DIR}/accounts 迁移 ${migrated} 个账号到 ${dataDir}/accounts`);
+  }
+  return { migrated, skipped, source: LEGACY_DATA_DIR, target: dataDir };
+}
+
+function ensureDirs(dataDir, log = () => {}) {
+  migrateLegacyDataDir(dataDir, log);
   fs.mkdirSync(accountsDir(dataDir), { recursive: true, mode: 0o700 });
   try {
     fs.chmodSync(dataDir, 0o700);
@@ -254,7 +319,7 @@ function backupAuthFile(dataDir, file, log = () => {}) {
 
 /** 备份目录里所有渠道登录文件（幂等），返回当前生效账号的信息 */
 function backupCurrent(dataDir, log = () => {}) {
-  ensureDirs(dataDir);
+  ensureDirs(dataDir, log);
   const files = listAuthFiles();
   if (!files.length) {
     throw new Error('未找到登录信息文件（' + authDir() + '）');
@@ -277,6 +342,7 @@ function backupCurrent(dataDir, log = () => {}) {
 
 /** 列出所有已备份账号（直接读备份文件提取展示字段，按最近刷新时间倒序） */
 function listAccounts(dataDir) {
+  migrateLegacyDataDir(dataDir);
   const dir = accountsDir(dataDir);
   let names = [];
   try {
@@ -323,7 +389,8 @@ function listAccounts(dataDir) {
 }
 
 /** 永久删除某个账号的备份文件（不影响当前登录） */
-function deleteAccount(dataDir, uid) {
+function deleteAccount(dataDir, uid, log = () => {}) {
+  migrateLegacyDataDir(dataDir, log);
   const file = backupPath(dataDir, uid);
   let deletedFile = false;
   if (fs.existsSync(file)) {
@@ -363,6 +430,7 @@ function authRealm(json) {
  *  把 .ai realm 的账号写进腾讯云渠道文件（或反之）是否被 5.4.x 接受没有证据，
  *  按 realm 回到原始渠道文件是最稳妥的选择；找不到匹配时才回退当前文件并告警。 */
 function switchTo(dataDir, uid, log = () => {}) {
+  migrateLegacyDataDir(dataDir, log);
   const src = backupPath(dataDir, uid);
   if (!fs.existsSync(src)) {
     throw new Error(`未找到账号 ${uid} 的备份文件`);
@@ -473,4 +541,5 @@ module.exports = {
   listAccounts,
   switchTo,
   deleteAccount,
+  migrateLegacyDataDir,
 };

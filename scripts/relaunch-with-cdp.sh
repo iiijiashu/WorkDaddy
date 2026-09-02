@@ -15,14 +15,35 @@ set -uo pipefail
 
 PORT="${WBSWITCH_CDP_PORT:-${1:-9222}}"
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LABEL="com.workbuddy.hellobuddy"
+LABEL="com.workbuddy.workdaddy"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-DATA_DIR="${WBSWITCH_DATA_DIR:-$HOME/Library/Application Support/HelloBuddy}"
+LEGACY_LABEL="com.workbuddy.hellobuddy"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
+DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy"
+LEGACY_DATA_DIR="$HOME/Library/Application Support/HelloBuddy"
+if [ "${WBSWITCH_DATA_DIR:-}" = "$LEGACY_DATA_DIR" ]; then
+  DATA_DIR="$DEFAULT_DATA_DIR"
+else
+  DATA_DIR="${WBSWITCH_DATA_DIR:-$DEFAULT_DATA_DIR}"
+fi
 AUTH_FILE="${WBSWITCH_AUTH_FILE:-$HOME/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop.info}"
 APP_BIN="/Applications/WorkBuddy.app/Contents/MacOS/Electron"
 
-# 统一使用的 node 路径（优先系统 PATH，兜底用 managed runtime）
-NODE_BIN="$(command -v node || echo /Users/h/.workbuddy/binaries/node/versions/22.22.2/bin/node)"
+# 统一使用的 node 路径（WorkBuddyAI/WorkBuddy managed runtime 优先）。
+NODE_BIN=""
+for base in "$HOME/.workbuddy-ai/binaries/node/versions" "$HOME/.workbuddy/binaries/node/versions"; do
+  for c in "$base"/*/bin/node; do
+    if [ -x "$c" ]; then NODE_BIN="$c"; break 2; fi
+  done
+done
+if [ -z "$NODE_BIN" ]; then NODE_BIN="$(command -v node 2>/dev/null || true)"; fi
+if [ -z "$NODE_BIN" ]; then echo "错误: 未找到 node"; exit 1; fi
+
+# 清理旧版常驻服务，但保留 HelloBuddy 数据目录；新 daemon 会在启动时迁移旧账号。
+launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST" 2>/dev/null || true
+launchctl remove "$LEGACY_LABEL" 2>/dev/null || true
+rm -f "$LEGACY_PLIST"
+"$NODE_BIN" -e "const lib = require(process.argv[1]); const r = lib.migrateLegacyDataDir(process.argv[2]); if (r.migrated) console.log('已迁移 ' + r.migrated + ' 个旧版账号备份');" "$DIR/scripts/lib.js" "$DATA_DIR" 2>/dev/null || true
 
 # ---------- 功能函数（必须先于调用定义） ----------
 
@@ -108,7 +129,7 @@ launch_plugin() {
     else
       echo "   警告：launchd 注册失败，改用 nohup 方式启动守护进程（重启电脑后需重新执行本脚本）"
       mkdir -p "$DATA_DIR/accounts"
-      nohup "$NODE_BIN" "$DIR/scripts/daemon.js" >> "$DATA_DIR/daemon.log" 2>&1 &
+      WBSWITCH_DATA_DIR="$DATA_DIR" nohup "$NODE_BIN" "$DIR/scripts/daemon.js" >> "$DATA_DIR/daemon.log" 2>&1 &
       disown 2>/dev/null || true
     fi
   else
@@ -116,8 +137,16 @@ launch_plugin() {
   fi
 
   # 等待守护进程就绪
+  API_PORT=""
   for i in $(seq 1 10); do
-    curl -s -m 1 "http://127.0.0.1:${PORT:-47832}/api/status" >/dev/null 2>&1 && { echo "==> 守护进程运行中"; break; }
+    local base_api_port="${WBSWITCH_PORT:-47832}"
+    for candidate in $(seq "$base_api_port" $((base_api_port + 7))); do
+      if curl -fsS -m 1 "http://127.0.0.1:${candidate}/healthz" >/dev/null 2>&1; then
+        API_PORT="$candidate"
+        echo "==> 守护进程运行中（端口 ${API_PORT}）"
+        break 2
+      fi
+    done
     sleep 1
   done
 
@@ -148,20 +177,26 @@ launch_plugin() {
   OK=0
   for i in $(seq 1 15); do
     sleep 1
-    if curl -s -m 2 "http://127.0.0.1:${PORT}/json/version" | grep -qiE 'Chrome|Electron|Chromium'; then
+    if curl -s -m 2 "http://127.0.0.1:${PORT}/json/version" | grep -qiE 'WorkBuddy|CodeBuddy'; then
       OK=1
       break
     fi
   done
 
   if [ "$OK" = "1" ]; then
+    API_PORT="${API_PORT:-${WBSWITCH_PORT:-47832}}"
+    TOKEN_FILE="$DATA_DIR/api-token"
+    if [ -s "$TOKEN_FILE" ]; then
+      curl -fsS -m 3 -X POST -H "X-WorkDaddy-Token: $(cat "$TOKEN_FILE")" \
+        "http://127.0.0.1:${API_PORT}/api/inject" >/dev/null 2>&1 || true
+    fi
     echo ""
     echo "CDP 已开启: http://127.0.0.1:${PORT}"
     echo "   WorkBuddy 启动后右下角会自动出现账号切换组件（约几秒内）。"
-    echo "   若未出现，可手动重新注入: curl -X POST http://127.0.0.1:47832/api/inject"
+    echo "   若未出现，请重新运行本脚本；本地 API 已启用令牌保护。"
   else
     echo ""
-    echo "警告：等待 15 秒仍未检测到 CDP 端口 ${PORT}。"
+    echo "警告：等待 15 秒仍未检测到 WorkBuddy CDP 端口 ${PORT}。"
     echo "   WorkBuddy 可能忽略了该参数，或启动较慢。可再等几秒后执行："
     echo "   curl http://127.0.0.1:${PORT}/json/version"
   fi

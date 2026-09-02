@@ -3,14 +3,26 @@
 # 用法: bash scripts/uninstall.sh
 set -euo pipefail
 
-LABEL="com.workbuddy.hellobuddy"
+LABEL="com.workbuddy.workdaddy"
 PLIST="$HOME/Library/LaunchAgents/${LABEL}.plist"
-DATA_DIR="${WBSWITCH_DATA_DIR:-$HOME/Library/Application Support/HelloBuddy}"
+LEGACY_LABEL="com.workbuddy.hellobuddy"
+LEGACY_PLIST="$HOME/Library/LaunchAgents/${LEGACY_LABEL}.plist"
+DEFAULT_DATA_DIR="$HOME/Library/Application Support/WorkDaddy"
+LEGACY_DATA_DIR="$HOME/Library/Application Support/HelloBuddy"
+if [ "${WBSWITCH_DATA_DIR:-}" = "$LEGACY_DATA_DIR" ]; then
+  DATA_DIR="$DEFAULT_DATA_DIR"
+else
+  DATA_DIR="${WBSWITCH_DATA_DIR:-$DEFAULT_DATA_DIR}"
+fi
 
 echo "==> 停止并移除 launchd 守护进程"
 launchctl bootout "gui/$(id -u)" "$PLIST" 2>/dev/null || true
 rm -f "$PLIST"
+launchctl bootout "gui/$(id -u)" "$LEGACY_PLIST" 2>/dev/null || true
+launchctl remove "$LEGACY_LABEL" 2>/dev/null || true
+rm -f "$LEGACY_PLIST"
 
 echo "==> 完成"
 echo "   备份数据保留在: $DATA_DIR"
+echo "   旧版 HelloBuddy 备份目录未删除，如需手动核对请查看: $HOME/Library/Application Support/HelloBuddy"
 echo "   如需彻底删除备份，请手动执行: rm -rf \"$DATA_DIR\""

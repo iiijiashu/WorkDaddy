@@ -1,11 +1,11 @@
 @echo off
-chcp 65001 >nul
 rem ============================================================
-rem  WorkDaddy Windows package verifier
-rem  Read-only checks for packaged scripts and launch prerequisites.
-rem  Safe to run repeatedly; this script does not change system state.
+rem  WorkDaddy Windows 安装包自检脚本（双击运行）
+rem  作用：验证 Setup.exe / zip 解出的 scripts 是否「完整、可装、可启动」
+rem  不修改任何系统状态，纯只读检查，可放心重复运行。
 rem ============================================================
 setlocal
+chcp 65001 >nul
 cd /d "%~dp0"
 set "SCRIPT_DIR=%~dp0"
 
@@ -18,7 +18,7 @@ set "FAIL=0"
 rem ---- 1) 关键文件齐全 ----
 echo.
 echo [1/6] 检查关键文件...
-for %%F in (daemon.js lib.js watchdog.js win-launcher.js win-inject-helper.js inject.js theme-patches.js launcher.cmd launch-hidden.vbs install-win.cmd install-win.ps1 repair-entrypoints.ps1 apply-update.ps1 win\setup.sed) do (
+for %%F in (daemon.js lib.js watchdog.js win-launcher.js win-inject-helper.js inject.js theme-patches.js launcher.cmd launcher-hidden.vbs install-win.cmd install-win.ps1 repair-entrypoints.ps1 apply-update.ps1 win\setup.sed) do (
   if not exist "%SCRIPT_DIR%%%F" (
     echo   缺失: %%~F
     set /a FAIL+=1
@@ -40,8 +40,11 @@ rem ---- 2) node 运行时可达性 ----
 echo.
 echo [2/6] 检查 node 运行时...
 set "NODE="
-for /d %%d in ("%USERPROFILE%\.workbuddy\binaries\node\versions\*") do (
+for /d %%d in ("%USERPROFILE%\.workbuddy-ai\binaries\node\versions\*") do (
   if exist "%%d\node.exe" set "NODE=%%d\node.exe"
+)
+for /d %%d in ("%USERPROFILE%\.workbuddy\binaries\node\versions\*") do (
+  if not defined NODE if exist "%%d\node.exe" set "NODE=%%d\node.exe"
 )
 if not defined NODE set "NODE=node"
 "%NODE%" --version >nul 2>&1
@@ -51,11 +54,16 @@ if errorlevel 1 (
 ) else (
   echo   可用: %NODE%
 )
+"%NODE%" --experimental-sqlite -e "require('node:sqlite')" >nul 2>&1
+if errorlevel 1 (
+  echo   错误: 当前 node 不支持 node:sqlite（Windows 会话管理不可用）
+  set /a FAIL+=1
+)
 
 rem ---- 3) 脚本语法静态检查（node --check，不执行）----
 echo.
 echo [3/6] 校验 JS 语法...
-for %%F in (daemon.js lib.js watchdog.js win-launcher.js inject.js theme-patches.js) do (
+for %%F in (daemon.js lib.js watchdog.js win-launcher.js win-inject-helper.js inject.js theme-patches.js) do (
   "%NODE%" --check "%SCRIPT_DIR%%%F" >nul 2>&1
   if errorlevel 1 (
     echo   语法错误: %%~F
@@ -63,22 +71,16 @@ for %%F in (daemon.js lib.js watchdog.js win-launcher.js inject.js theme-patches
   )
 )
 echo   JS 语法检查完成
-cscript //B //Nologo "%SCRIPT_DIR%launch-hidden.vbs" /check >nul 2>&1
+cscript //B //Nologo "%SCRIPT_DIR%launcher-hidden.vbs" /check >nul 2>&1
 if errorlevel 1 (
-  echo   语法错误: launch-hidden.vbs
+  echo   语法错误: launcher-hidden.vbs
   set /a FAIL+=1
 )
 
 rem ---- 4) PS1 合法性（PowerShell 解析但不执行）----
 echo.
 echo [4/6] 校验 PS1 脚本语法...
-for %%F in (install-win.ps1 repair-entrypoints.ps1 apply-update.ps1 uninstall-win.ps1) do (
-  powershell -NoProfile -ExecutionPolicy Bypass -Command "$e=$null; [void][System.Management.Automation.Language.Parser]::ParseFile('%SCRIPT_DIR%%%F',[ref]$null,[ref]$e); if($e){Write-Host ('  语法错误: ' + $e.Message); exit 1} else {Write-Host ('  OK: ' + '%%~nF')}; exit 0" >nul 2>&1
-  if errorlevel 1 (
-    echo   语法错误: %%~F
-    set /a FAIL+=1
-  )
-)
+for %%F in (install-win.ps1 repair-entrypoints.ps1 apply-update.ps1 uninstall-win.ps1) do call :CheckPs1 "%SCRIPT_DIR%%%F" "%%~F"
 
 rem ---- 5) 自启注册表与安装目录回写测试（读态 + 安装目录可写性探测）----
 echo.
@@ -116,3 +118,14 @@ if "%FAIL%"=="0" (
 echo ============================================================
 if /I not "%~1"=="--ci" pause
 exit /b %FAIL%
+
+:CheckPs1
+set "PS1_CHECK_PATH=%~1"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "$tokens=$null; $errors=$null; [void][System.Management.Automation.Language.Parser]::ParseFile($env:PS1_CHECK_PATH,[ref]$tokens,[ref]$errors); if($errors.Count -gt 0){exit 1}; exit 0" >nul 2>&1
+if errorlevel 1 (
+  echo   语法错误: %~2
+  set /a FAIL+=1
+) else (
+  echo   OK: %~2
+)
+exit /b 0
